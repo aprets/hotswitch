@@ -1,0 +1,14 @@
+[package]
+name = "hotswitch-receiver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hotswitch-proto = { path = "../proto" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]

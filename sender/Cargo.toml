@@ -1,0 +1,11 @@
+[package]
+name = "hotswitch-sender"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hotswitch-proto = { path = "../proto" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+core-foundation = "0.10"

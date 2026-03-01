@@ -1,0 +1,29 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-sender:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p hotswitch-proto
+      - run: cargo build --release -p hotswitch-sender
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotswitch-sender-macos
+          path: target/release/hotswitch-sender
+
+  build-receiver:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p hotswitch-receiver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotswitch-receiver-windows
+          path: target/release/hotswitch-receiver.exe
