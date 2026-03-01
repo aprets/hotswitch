@@ -141,6 +141,9 @@ fn main() {
         .unwrap_or_else(|| "0.0.0.0:24801".to_string());
 
     let socket = UdpSocket::bind(&listen_addr).expect("Failed to bind UDP socket");
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok();
     println!("hotswitch receiver listening on {listen_addr}");
 
     let mut buf = [0u8; 512];
@@ -153,6 +156,15 @@ fn main() {
     loop {
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timeout — fall through to heartbeat stale check below
+                if sender_addr.is_some() && last_heartbeat.elapsed().as_secs() > 5 {
+                    eprintln!("WARNING: no heartbeat for 5s — sender may be disconnected");
+                    last_heartbeat = Instant::now();
+                }
+                continue;
+            }
             Err(e) => {
                 eprintln!("recv error: {e}");
                 continue;

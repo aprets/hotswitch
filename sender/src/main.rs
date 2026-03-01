@@ -304,6 +304,7 @@ fn main() {
         let mut buf = [0u8; 8];
         let mut was_connected = false;
         let mut last_recv = Instant::now();
+        eprintln!("waiting for receiver...");
         loop {
             match sock_rx.recv(&mut buf) {
                 Ok(n) if Event::from_bytes(&buf[..n]).is_some() => {
@@ -316,7 +317,7 @@ fn main() {
                 _ => {}
             }
             if was_connected && last_recv.elapsed().as_secs() > 3 {
-                eprintln!("WARNING: receiver not responding");
+                eprintln!("WARNING: receiver disconnected");
                 was_connected = false;
             }
             thread::sleep(Duration::from_millis(500));
