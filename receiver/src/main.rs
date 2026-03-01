@@ -150,18 +150,28 @@ fn main() {
     let mut hb_buf = [0u8; 1];
     let hb_len = Event::Heartbeat.to_bytes(&mut hb_buf);
     let mut held_keys: HashSet<u16> = HashSet::new();
+    let mut sender_connected = false;
     let mut last_heartbeat = Instant::now();
     let mut sender_addr = None;
+
+    let release_all_keys = |keys: &mut HashSet<u16>| {
+        for &k in keys.iter() {
+            if let Some((sc, ext)) = keymap::cg_to_win_scancode(k) {
+                inject::key_event(sc, ext, false);
+            }
+        }
+        keys.clear();
+    };
 
     loop {
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout — fall through to heartbeat stale check below
-                if sender_addr.is_some() && last_heartbeat.elapsed().as_secs() > 5 {
-                    eprintln!("WARNING: no heartbeat for 5s — sender may be disconnected");
-                    last_heartbeat = Instant::now();
+                if sender_connected && last_heartbeat.elapsed().as_secs() > 5 {
+                    release_all_keys(&mut held_keys);
+                    eprintln!("WARNING: sender disconnected");
+                    sender_connected = false;
                 }
                 continue;
             }
@@ -171,9 +181,13 @@ fn main() {
             }
         };
 
-        if sender_addr.is_none() || sender_addr != Some(src) {
+        if !sender_connected || sender_addr != Some(src) {
+            if sender_connected {
+                release_all_keys(&mut held_keys);
+            }
             println!("sender connected from {src}");
             sender_addr = Some(src);
+            sender_connected = true;
         }
 
         match Event::from_bytes(&buf[..n]) {
@@ -223,10 +237,5 @@ fn main() {
             }
         }
 
-        // Warn if heartbeat is stale
-        if last_heartbeat.elapsed().as_secs() > 5 {
-            eprintln!("WARNING: no heartbeat for 5s — sender may be disconnected");
-            last_heartbeat = Instant::now(); // avoid spam
-        }
     }
 }
