@@ -144,17 +144,25 @@ fn main() {
     println!("hotswitch receiver listening on {listen_addr}");
 
     let mut buf = [0u8; 512];
-    let mut held_keys: HashSet<u16> = HashSet::new(); // CGKeyCodes currently held
+    let mut hb_buf = [0u8; 1];
+    let hb_len = Event::Heartbeat.to_bytes(&mut hb_buf);
+    let mut held_keys: HashSet<u16> = HashSet::new();
     let mut last_heartbeat = Instant::now();
+    let mut sender_addr = None;
 
     loop {
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
+        let (n, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("recv error: {e}");
                 continue;
             }
         };
+
+        if sender_addr.is_none() || sender_addr != Some(src) {
+            println!("sender connected from {src}");
+            sender_addr = Some(src);
+        }
 
         match Event::from_bytes(&buf[..n]) {
             Some(Event::MouseMove { dx, dy }) => {
@@ -196,6 +204,7 @@ fn main() {
             }
             Some(Event::Heartbeat) => {
                 last_heartbeat = Instant::now();
+                let _ = socket.send_to(&hb_buf[..hb_len], src);
             }
             None => {
                 eprintln!("unknown packet ({n} bytes)");

@@ -1,4 +1,4 @@
-use core_foundation::{base::TCFType, runloop::CFRunLoop};
+use core_foundation::{base::TCFType, boolean::CFBoolean, runloop::CFRunLoop, string::CFString};
 use core_graphics::{
     display::CGDisplay,
     event::{
@@ -15,13 +15,15 @@ use std::{
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-// CoreGraphics functions not exposed by the core-graphics crate
+// CoreGraphics / CoreGraphicsServer functions not exposed by the crate
 extern "C" {
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn _CGSDefaultConnection() -> i32;
+    fn CGSSetConnectionProperty(connection: i32, target: i32, key: *const c_void, value: *const c_void) -> i32;
 }
 
 /// Hotkey: Ctrl + Escape (matching the plan)
@@ -62,6 +64,16 @@ fn main() {
         .connect(&target_addr)
         .expect("Failed to connect UDP socket");
     socket.set_nonblocking(true).ok();
+
+    // Allow CGDisplayHideCursor to work from a background/terminal process (private CGS API, used by Barrier and lan-mouse)
+    unsafe {
+        let conn = _CGSDefaultConnection();
+        let key = CFString::new("SetsCursorInBackground");
+        let val = CFBoolean::true_value();
+        if CGSSetConnectionProperty(conn, conn, key.as_CFTypeRef(), val.as_CFTypeRef()) != 0 {
+            eprintln!("WARNING: Failed to set SetsCursorInBackground — cursor may not hide");
+        }
+    }
 
     println!("hotswitch sender → {target_addr}");
     println!("Press Ctrl+Escape to toggle capture");
@@ -285,6 +297,31 @@ fn main() {
     unsafe {
         CFRunLoop::get_current().add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
     }
+
+    // Receiver heartbeat listener — polls the same (nonblocking) socket for reply heartbeats
+    let sock_rx = socket.try_clone().expect("Failed to clone socket");
+    thread::spawn(move || {
+        let mut buf = [0u8; 8];
+        let mut was_connected = false;
+        let mut last_recv = Instant::now();
+        loop {
+            match sock_rx.recv(&mut buf) {
+                Ok(n) if Event::from_bytes(&buf[..n]).is_some() => {
+                    if !was_connected {
+                        eprintln!("receiver connected");
+                        was_connected = true;
+                    }
+                    last_recv = Instant::now();
+                }
+                _ => {}
+            }
+            if was_connected && last_recv.elapsed().as_secs() > 3 {
+                eprintln!("WARNING: receiver not responding");
+                was_connected = false;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
 
     // Heartbeat + key sync thread
     let cap2 = capturing.clone();
