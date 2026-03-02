@@ -32,13 +32,16 @@ pub fn make_icon_rgba(r: u8, g: u8, b: u8, filled: bool) -> (Vec<u8>, u32) {
         }
     }
 
-    let fg: [u8; 4] = if filled { [255, 255, 255, 255] } else { [r, g, b, 255] };
-    draw_arrows(&mut rgba, sz, &fg);
+    if filled {
+        draw_arrows(&mut rgba, sz, &[0; 4], true);
+    } else {
+        draw_arrows(&mut rgba, sz, &[r, g, b, 255], false);
+    }
 
     (rgba, sz)
 }
 
-fn draw_arrows(rgba: &mut [u8], sz: u32, color: &[u8; 4]) {
+fn draw_arrows(rgba: &mut [u8], sz: u32, color: &[u8; 4], cutout: bool) {
     let cx = sz as f32 / 2.0;
     let cy = cx;
     let s = sz as f32 / 128.0;
@@ -46,6 +49,14 @@ fn draw_arrows(rgba: &mut [u8], sz: u32, color: &[u8; 4]) {
     let set_px = |rgba: &mut [u8], x: i32, y: i32, a: f32| {
         if x < 0 || y < 0 || x >= sz as i32 || y >= sz as i32 { return; }
         let i = ((y as u32 * sz + x as u32) * 4) as usize;
+        if cutout {
+            let keep = (1.0 - a).max(0.0);
+            rgba[i]     = (rgba[i]     as f32 * keep) as u8;
+            rgba[i + 1] = (rgba[i + 1] as f32 * keep) as u8;
+            rgba[i + 2] = (rgba[i + 2] as f32 * keep) as u8;
+            rgba[i + 3] = (rgba[i + 3] as f32 * keep) as u8;
+            return;
+        }
         let sa = a * (color[3] as f32 / 255.0);
         let da = rgba[i + 3] as f32 / 255.0;
         let oa = sa + da * (1.0 - sa);
