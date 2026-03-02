@@ -11,27 +11,99 @@ use std::{
     collections::HashSet,
     ffi::c_void,
     net::UdpSocket,
+    path::PathBuf,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::{
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    Icon, TrayIconBuilder,
+};
 
-// CoreGraphics / CoreGraphicsServer functions not exposed by the crate
 extern "C" {
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
     fn _CGSDefaultConnection() -> i32;
-    fn CGSSetConnectionProperty(connection: i32, target: i32, key: *const c_void, value: *const c_void) -> i32;
+    fn CGSSetConnectionProperty(
+        connection: i32,
+        target: i32,
+        key: *const c_void,
+        value: *const c_void,
+    ) -> i32;
 }
 
-/// Hotkey: Ctrl + Escape (matching the plan)
 const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
 const HOTKEY_REQUIRES_CTRL: bool = true;
 
-/// Mouse button mapping: CGEvent button number → our protocol button index
-/// 0 = left, 1 = right, 2 = middle, 3 = back, 4 = forward
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum AppState {
+    Waiting = 0,
+    Connected = 1,
+    Capturing = 2,
+}
+
+impl AppState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Connected,
+            2 => Self::Capturing,
+            _ => Self::Waiting,
+        }
+    }
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Waiting => "Hotswitch — Waiting for receiver",
+            Self::Connected => "Hotswitch — Connected",
+            Self::Capturing => "Hotswitch — Capturing",
+        }
+    }
+    fn icon(self) -> Icon {
+        match self {
+            Self::Waiting => make_dot_icon(128, 128, 128),
+            Self::Connected => make_dot_icon(34, 197, 94),
+            Self::Capturing => make_dot_icon(234, 179, 8),
+        }
+    }
+    fn status_text(self) -> &'static str {
+        match self {
+            Self::Waiting => "Waiting for receiver...",
+            Self::Connected => "Connected",
+            Self::Capturing => "Capturing",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum UserEvent {
+    StateChanged,
+}
+
+fn make_dot_icon(r: u8, g: u8, b: u8) -> Icon {
+    let size = 16u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    let center = size as f32 / 2.0;
+    let radius = center - 1.0;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - center + 0.5;
+            let dy = y as f32 - center + 0.5;
+            let i = ((y * size + x) * 4) as usize;
+            if dx * dx + dy * dy <= radius * radius {
+                rgba[i] = r;
+                rgba[i + 1] = g;
+                rgba[i + 2] = b;
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+    Icon::from_rgba(rgba, size, size).unwrap()
+}
+
 fn map_mouse_button(event_type: &CGEventType, ev: &CGEvent) -> Option<(u8, bool)> {
     match event_type {
         CGEventType::LeftMouseDown => Some((0, true)),
@@ -41,9 +113,9 @@ fn map_mouse_button(event_type: &CGEventType, ev: &CGEvent) -> Option<(u8, bool)
         CGEventType::OtherMouseDown | CGEventType::OtherMouseUp => {
             let btn = ev.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
             let mapped = match btn {
-                2 => 2,  // middle
-                3 => 3,  // back
-                4 => 4,  // forward
+                2 => 2,
+                3 => 3,
+                4 => 4,
                 n => n as u8,
             };
             let pressed = matches!(event_type, CGEventType::OtherMouseDown);
@@ -53,8 +125,97 @@ fn map_mouse_button(event_type: &CGEventType, ev: &CGEvent) -> Option<(u8, bool)
     }
 }
 
+// --- Log file ---
+
+fn log_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join("Library/Logs")
+        .join("hotswitch-sender.log")
+}
+
+fn redirect_stdio_to_log() -> PathBuf {
+    extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    let path = log_path();
+    if let Ok(file) = std::fs::File::create(&path) {
+        use std::os::unix::io::IntoRawFd;
+        let fd = file.into_raw_fd();
+        unsafe {
+            dup2(fd, 1);
+            dup2(fd, 2);
+            close(fd);
+        }
+    }
+    path
+}
+
+// --- Start on Login (macOS LaunchAgent) ---
+
+fn launch_agent_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join("com.hotswitch.sender.plist")
+}
+
+fn is_login_item() -> bool {
+    launch_agent_path().exists()
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn set_login_item(enabled: bool, target_addr: &str) {
+    let path = launch_agent_path();
+    if enabled {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to get current exe path: {e}");
+                return;
+            }
+        };
+        let exe_escaped = xml_escape(&exe.display().to_string());
+        let addr_escaped = xml_escape(target_addr);
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hotswitch.sender</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe_escaped}</string>
+        <string>{addr_escaped}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"#
+        );
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, plist);
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 fn main() {
-    // TODO: read from config.toml
+    let log_file_path = redirect_stdio_to_log();
+
     let target_addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "10.0.0.100:24801".to_string());
@@ -65,7 +226,6 @@ fn main() {
         .expect("Failed to connect UDP socket");
     socket.set_nonblocking(true).ok();
 
-    // Allow CGDisplayHideCursor to work from a background/terminal process (private CGS API, used by Barrier and lan-mouse)
     unsafe {
         let conn = _CGSDefaultConnection();
         let key = CFString::new("SetsCursorInBackground");
@@ -75,18 +235,38 @@ fn main() {
         }
     }
 
-    println!("hotswitch sender → {target_addr}");
-    println!("Press Ctrl+Escape to toggle capture");
-
+    // Shared state: Waiting / Connected / Capturing
+    let app_state = Arc::new(AtomicU8::new(AppState::Waiting as u8));
     let capturing = Arc::new(AtomicBool::new(false));
+    let receiver_connected = Arc::new(AtomicBool::new(false));
     let held_keys: Arc<std::sync::Mutex<HashSet<u16>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
-
-    // Fractional mouse delta accumulators (Moonlight-style)
     let accum_dx = Arc::new(std::sync::Mutex::new(0.0f64));
     let accum_dy = Arc::new(std::sync::Mutex::new(0.0f64));
 
-    // Clone references for the event tap callback
+    // Tao event loop
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+
+    // Helper to recompute and store combined AppState
+    let compute_state = {
+        let capturing = capturing.clone();
+        let receiver_connected = receiver_connected.clone();
+        let app_state = app_state.clone();
+        move || -> AppState {
+            let s = if capturing.load(Ordering::SeqCst) {
+                AppState::Capturing
+            } else if receiver_connected.load(Ordering::SeqCst) {
+                AppState::Connected
+            } else {
+                AppState::Waiting
+            };
+            app_state.store(s as u8, Ordering::SeqCst);
+            s
+        }
+    };
+
+    // --- CGEventTap setup ---
     let cap = capturing.clone();
     let sock = socket.try_clone().expect("Failed to clone socket");
     let keys = held_keys.clone();
@@ -94,6 +274,8 @@ fn main() {
     let ady = accum_dy.clone();
     let tap_port: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(ptr::null_mut()));
     let tp = tap_port.clone();
+    let proxy_tap = proxy.clone();
+    let compute_tap = compute_state.clone();
 
     let cg_events_of_interest: Vec<CGEventType> = vec![
         CGEventType::LeftMouseDown,
@@ -126,7 +308,6 @@ fn main() {
                 return CallbackResult::Keep;
             }
 
-            // Check for hotkey (Ctrl + Escape)
             if matches!(event_type, CGEventType::KeyDown) {
                 let keycode = cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                 if keycode == HOTKEY_KEYCODE {
@@ -140,14 +321,11 @@ fn main() {
                         if now_capturing {
                             unsafe { CGAssociateMouseAndMouseCursorPosition(false); }
                             let _ = CGDisplay::hide_cursor(&CGDisplay::main());
-                            // Reset accumulators
                             *adx.lock().unwrap() = 0.0;
                             *ady.lock().unwrap() = 0.0;
-                            eprintln!("CAPTURE ON → sending input to remote");
                         } else {
                             unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
                             let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                            // Release all held keys on the remote
                             let held: Vec<u16> = keys.lock().unwrap().drain().collect();
                             let mut buf = [0u8; 64];
                             for keycode in held {
@@ -155,8 +333,9 @@ fn main() {
                                 let len = evt.to_bytes(&mut buf);
                                 let _ = sock.send(&buf[..len]);
                             }
-                            eprintln!("CAPTURE OFF → input back to Mac");
                         }
+                        compute_tap();
+                        let _ = proxy_tap.send_event(UserEvent::StateChanged);
                         return CallbackResult::Drop;
                     }
                 }
@@ -166,29 +345,23 @@ fn main() {
                 return CallbackResult::Keep;
             }
 
-            // We are capturing — serialize and send the event, then swallow it
             let mut buf = [0u8; 64];
 
             match event_type {
-                // Mouse movement
                 CGEventType::MouseMoved
                 | CGEventType::LeftMouseDragged
                 | CGEventType::RightMouseDragged
                 | CGEventType::OtherMouseDragged => {
                     let raw_dx = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
                     let raw_dy = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-
-                    // Accumulate fractional deltas (Moonlight approach)
                     let mut ax = adx.lock().unwrap();
                     let mut ay = ady.lock().unwrap();
                     *ax += raw_dx;
                     *ay += raw_dy;
-
                     let dx = (*ax).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
                     let dy = (*ay).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
                     *ax -= dx as f64;
                     *ay -= dy as f64;
-
                     if dx != 0 || dy != 0 {
                         let evt = Event::MouseMove { dx, dy };
                         let len = evt.to_bytes(&mut buf);
@@ -196,7 +369,6 @@ fn main() {
                     }
                 }
 
-                // Mouse buttons
                 CGEventType::LeftMouseDown
                 | CGEventType::LeftMouseUp
                 | CGEventType::RightMouseDown
@@ -210,7 +382,6 @@ fn main() {
                     }
                 }
 
-                // Scroll wheel
                 CGEventType::ScrollWheel => {
                     let v = cg_ev
                         .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
@@ -225,15 +396,11 @@ fn main() {
                     }
                 }
 
-                // Keyboard
                 CGEventType::KeyDown => {
                     let keycode =
                         cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                     keys.lock().unwrap().insert(keycode);
-                    let evt = Event::Key {
-                        keycode,
-                        pressed: true,
-                    };
+                    let evt = Event::Key { keycode, pressed: true };
                     let len = evt.to_bytes(&mut buf);
                     let _ = sock.send(&buf[..len]);
                 }
@@ -241,10 +408,7 @@ fn main() {
                     let keycode =
                         cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                     keys.lock().unwrap().remove(&keycode);
-                    let evt = Event::Key {
-                        keycode,
-                        pressed: false,
-                    };
+                    let evt = Event::Key { keycode, pressed: false };
                     let len = evt.to_bytes(&mut buf);
                     let _ = sock.send(&buf[..len]);
                 }
@@ -261,11 +425,7 @@ fn main() {
                         0x39 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
                         _ => !k.contains(&keycode),
                     };
-                    if pressed {
-                        k.insert(keycode);
-                    } else {
-                        k.remove(&keycode);
-                    }
+                    if pressed { k.insert(keycode); } else { k.remove(&keycode); }
                     drop(k);
                     let evt = Event::Key { keycode, pressed };
                     let len = evt.to_bytes(&mut buf);
@@ -298,33 +458,39 @@ fn main() {
         CFRunLoop::get_current().add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
     }
 
-    // Receiver heartbeat listener — polls the same (nonblocking) socket for reply heartbeats
+    // --- Heartbeat listener thread ---
     let sock_rx = socket.try_clone().expect("Failed to clone socket");
+    let rc = receiver_connected.clone();
+    let proxy_hb = proxy.clone();
+    let compute_hb = compute_state.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 8];
         let mut was_connected = false;
         let mut last_recv = Instant::now();
-        eprintln!("waiting for receiver...");
         loop {
             match sock_rx.recv(&mut buf) {
                 Ok(n) if Event::from_bytes(&buf[..n]).is_some() => {
                     if !was_connected {
-                        eprintln!("receiver connected");
+                        rc.store(true, Ordering::SeqCst);
                         was_connected = true;
+                        compute_hb();
+                        let _ = proxy_hb.send_event(UserEvent::StateChanged);
                     }
                     last_recv = Instant::now();
                 }
                 _ => {}
             }
             if was_connected && last_recv.elapsed().as_secs() > 3 {
-                eprintln!("WARNING: receiver disconnected");
+                rc.store(false, Ordering::SeqCst);
                 was_connected = false;
+                compute_hb();
+                let _ = proxy_hb.send_event(UserEvent::StateChanged);
             }
             thread::sleep(Duration::from_millis(500));
         }
     });
 
-    // Heartbeat + key sync thread
+    // --- Heartbeat + key sync thread ---
     let cap2 = capturing.clone();
     let keys2 = held_keys.clone();
     let sock2 = socket.try_clone().expect("Failed to clone socket");
@@ -334,16 +500,12 @@ fn main() {
         loop {
             thread::sleep(Duration::from_millis(100));
             tick += 1;
-
             if cap2.load(Ordering::SeqCst) {
-                // Key sync every 100ms
                 let held: Vec<u16> = keys2.lock().unwrap().iter().copied().collect();
                 let evt = Event::KeySync { keys: held };
                 let len = evt.to_bytes(&mut buf);
                 let _ = sock2.send(&buf[..len]);
             }
-
-            // Heartbeat every 1s (every 10th tick)
             if tick % 10 == 0 {
                 let evt = Event::Heartbeat;
                 let len = evt.to_bytes(&mut buf);
@@ -352,6 +514,66 @@ fn main() {
         }
     });
 
-    println!("Event tap running. Ctrl+C to quit.");
-    CFRunLoop::run_current();
+    // --- Tray icon setup + event loop ---
+    let menu = Menu::new();
+    let status_item = MenuItem::new(AppState::Waiting.status_text(), false, None);
+    let log_item = MenuItem::new("Show Log", true, None);
+    let login_item = CheckMenuItem::new("Start on Login", true, is_login_item(), None);
+    let quit_item = MenuItem::new("Quit", true, None);
+    let _ = menu.append_items(&[
+        &status_item,
+        &PredefinedMenuItem::separator(),
+        &log_item,
+        &login_item,
+        &PredefinedMenuItem::separator(),
+        &quit_item,
+    ]);
+
+    let initial_state = AppState::Waiting;
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip(initial_state.tooltip())
+        .with_icon(initial_state.icon())
+        .build()
+        .expect("Failed to create tray icon");
+
+    let menu_rx = MenuEvent::receiver();
+    let log_id = log_item.id().clone();
+    let login_id = login_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    let addr_for_login = target_addr.clone();
+
+    let mut last_state = initial_state;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        // Handle user events (state changes from background threads)
+        if let tao::event::Event::UserEvent(UserEvent::StateChanged) = &event {
+            let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
+            if new_state != last_state {
+                let _ = tray.set_tooltip(Some(new_state.tooltip()));
+                let _ = tray.set_icon(Some(new_state.icon()));
+                status_item.set_text(new_state.status_text());
+                last_state = new_state;
+            }
+        }
+
+        // Handle menu events
+        if let Ok(event) = menu_rx.try_recv() {
+            if event.id == quit_id {
+                if capturing.load(Ordering::SeqCst) {
+                    unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
+                    let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                }
+                *control_flow = ControlFlow::Exit;
+            } else if event.id == log_id {
+                let _ = std::process::Command::new("open").arg(&log_file_path).spawn();
+            } else if event.id == login_id {
+                let now_checked = !login_item.is_checked();
+                login_item.set_checked(now_checked);
+                set_login_item(now_checked, &addr_for_login);
+            }
+        }
+    });
 }

@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 hotswitch-proto = { path = "../proto" }
+tray-icon = "0.21"
+tao = "0.34"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"

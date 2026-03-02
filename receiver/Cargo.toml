@@ -5,10 +5,13 @@ edition = "2021"
 
 [dependencies]
 hotswitch-proto = { path = "../proto" }
+tray-icon = "0.21"
+tao = "0.34"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
 ]
