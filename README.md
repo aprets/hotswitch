@@ -1,6 +1,6 @@
 # Hotswitch
 
-Minimal software KVM for sharing a Mac's keyboard and mouse with a Windows PC over LAN. Press a hotkey to send input to the PC, press again to reclaim it. Built for low-latency FPS gaming — plain UDP, no video, no encryption, just raw input forwarding.
+Minimal software KVM for sharing a Mac's keyboard and mouse with a Windows PC over LAN. Press a hotkey to send input to the PC, press again to reclaim it. Built for low-latency use (e.g. gaming). Raw input over unencrypted UDP, no video or screen sharing.
 
 ## How it works
 
@@ -9,7 +9,7 @@ Mac (sender)                  UDP / LAN              Windows (receiver)
 CGEventTap ───────────────> 3–5 byte datagrams ────> SendInput
 ```
 
-The sender captures keyboard and mouse events on macOS via `CGEventTap`, serializes them into tiny UDP packets, and sends them to the receiver. The receiver injects them as native Windows input via `SendInput` with hardware scancodes.
+The sender captures keyboard and mouse events on macOS via `CGEventTap`, serializes them into UDP packets, and sends them to the receiver. The receiver injects them as native Windows input via `SendInput` with hardware scancodes.
 
 When capturing, the Mac cursor is hidden and locked. Mouse deltas and key events are forwarded to Windows. A key-sync packet every 100ms guards against dropped UDP key-up packets.
 
@@ -38,8 +38,8 @@ hotswitch-receiver.exe 0.0.0.0:24801
 
 ### Controls
 
-- **Ctrl+Escape** — toggle capture (send input to Windows / reclaim on Mac)
-- Both sides run as **system tray apps** with status icons and menus
+- **Ctrl+Escape**: toggle capture (send input to Windows / reclaim on Mac)
+- Both sides run as system tray apps with status icons and menus
 
 ### Tray menu (both sides)
 
@@ -66,7 +66,7 @@ cargo test -p hotswitch-proto
 
 ## Releasing
 
-Tag a version and push — GitHub Actions builds both binaries and publishes a release:
+Tag a version and push. GitHub Actions builds both binaries and publishes a release.
 
 ```bash
 git tag v0.2.0
