@@ -1,3 +1,4 @@
+pub mod icon;
 pub mod keymap;
 
 /// Packet type tags

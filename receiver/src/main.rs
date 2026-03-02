@@ -161,10 +161,10 @@ impl AppState {
             Self::Connected => "Hotswitch — Connected",
         }
     }
-    fn icon(self) -> Icon {
+    fn icon(self) -> (Icon, bool) {
         match self {
-            Self::Listening => make_dot_icon(128, 128, 128),
-            Self::Connected => make_dot_icon(34, 197, 94),
+            Self::Listening => (make_icon(0, 0, 0, false), true),
+            Self::Connected => (make_icon(0, 0, 0, true), true),
         }
     }
     fn status_text(self) -> &'static str {
@@ -181,25 +181,9 @@ enum UserEvent {
     Menu(tray_icon::menu::MenuEvent),
 }
 
-fn make_dot_icon(r: u8, g: u8, b: u8) -> Icon {
-    let size = 16u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let center = size as f32 / 2.0;
-    let radius = center - 1.0;
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - center + 0.5;
-            let dy = y as f32 - center + 0.5;
-            let i = ((y * size + x) * 4) as usize;
-            if dx * dx + dy * dy <= radius * radius {
-                rgba[i] = r;
-                rgba[i + 1] = g;
-                rgba[i + 2] = b;
-                rgba[i + 3] = 255;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, size, size).unwrap()
+fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
+    let (rgba, sz) = hotswitch_proto::icon::make_icon_rgba(r, g, b, filled);
+    Icon::from_rgba(rgba, sz, sz).unwrap()
 }
 
 // --- Log file ---
@@ -474,10 +458,12 @@ fn main() {
     }));
 
     let initial_state = AppState::Listening;
+    let (init_icon, init_template) = initial_state.icon();
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(initial_state.tooltip())
-        .with_icon(initial_state.icon())
+        .with_icon(init_icon)
+        .with_icon_as_template(init_template)
         .build()
         .expect("Failed to create tray icon");
 
@@ -496,8 +482,9 @@ fn main() {
                 UserEvent::StateChanged => {
                     let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
                     if new_state != last_state {
+                        let (icon, tmpl) = new_state.icon();
                         let _ = _tray.set_tooltip(Some(new_state.tooltip()));
-                        let _ = _tray.set_icon(Some(new_state.icon()));
+                        let _ = _tray.set_icon_with_as_template(Some(icon), tmpl);
                         status_item.set_text(new_state.status_text());
                         last_state = new_state;
                     }
