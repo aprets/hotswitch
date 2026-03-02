@@ -178,6 +178,7 @@ impl AppState {
 #[derive(Debug)]
 enum UserEvent {
     StateChanged,
+    Menu(tray_icon::menu::MenuEvent),
 }
 
 fn make_dot_icon(r: u8, g: u8, b: u8) -> Icon {
@@ -290,7 +291,7 @@ fn is_login_item() -> bool {
 }
 
 #[cfg(windows)]
-fn set_login_item(enabled: bool) {
+fn set_login_item(enabled: bool) -> bool {
     use windows::Win32::System::Registry::*;
     use windows::core::HSTRING;
     let key_path = HSTRING::from("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -300,16 +301,16 @@ fn set_login_item(enabled: bool) {
     };
     if result.is_err() {
         eprintln!("Failed to open registry key");
-        return;
+        return false;
     }
     let value_name = HSTRING::from("Hotswitch");
-    if enabled {
+    let ok = if enabled {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Failed to get current exe path: {e}");
                 unsafe { let _ = RegCloseKey(hkey); }
-                return;
+                return false;
             }
         };
         let exe_str = exe.to_string_lossy();
@@ -317,19 +318,23 @@ fn set_login_item(enabled: bool) {
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
         };
-        let _ = unsafe {
-            RegSetValueExW(hkey, &value_name, 0, REG_SZ, Some(bytes))
-        };
+        unsafe { RegSetValueExW(hkey, &value_name, 0, REG_SZ, Some(bytes)).is_ok() }
     } else {
-        let _ = unsafe { RegDeleteValueW(hkey, &value_name) };
-    }
+        // Already absent is fine
+        match unsafe { RegDeleteValueW(hkey, &value_name) } {
+            Ok(()) => true,
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(2) => true, // ERROR_FILE_NOT_FOUND
+            Err(e) => { eprintln!("failed to remove registry value: {e}"); false }
+        }
+    };
     unsafe { let _ = RegCloseKey(hkey); }
+    ok
 }
 
 #[cfg(not(windows))]
 fn is_login_item() -> bool { false }
 #[cfg(not(windows))]
-fn set_login_item(_enabled: bool) {}
+fn set_login_item(_enabled: bool) -> bool { true }
 
 fn main() {
     let log_file_path = redirect_stdio_to_log();
@@ -349,6 +354,7 @@ fn main() {
 
     // --- Receiver network thread ---
     let state = app_state.clone();
+    let net_proxy = proxy.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 512];
         let mut hb_buf = [0u8; 1];
@@ -378,7 +384,7 @@ fn main() {
                         eprintln!("WARNING: sender disconnected");
                         sender_connected = false;
                         state.store(AppState::Listening as u8, Ordering::SeqCst);
-                        let _ = proxy.send_event(UserEvent::StateChanged);
+                        let _ = net_proxy.send_event(UserEvent::StateChanged);
                     }
                     continue;
                 }
@@ -397,7 +403,7 @@ fn main() {
                 sender_connected = true;
                 last_heartbeat = Instant::now();
                 state.store(AppState::Connected as u8, Ordering::SeqCst);
-                let _ = proxy.send_event(UserEvent::StateChanged);
+                let _ = net_proxy.send_event(UserEvent::StateChanged);
             }
 
             match Event::from_bytes(&buf[..n]) {
@@ -462,6 +468,11 @@ fn main() {
         &quit_item,
     ]);
 
+    let menu_proxy = proxy.clone();
+    MenuEvent::set_event_handler(Some(move |evt| {
+        let _ = menu_proxy.send_event(UserEvent::Menu(evt));
+    }));
+
     let initial_state = AppState::Listening;
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -470,35 +481,39 @@ fn main() {
         .build()
         .expect("Failed to create tray icon");
 
-    let menu_rx = MenuEvent::receiver();
     let log_id = log_item.id().clone();
     let login_id = login_item.id().clone();
     let quit_id = quit_item.id().clone();
+    let mut login_checked = is_login_item();
 
     let mut last_state = initial_state;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
-        if let tao::event::Event::UserEvent(UserEvent::StateChanged) = &event {
-            let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
-            if new_state != last_state {
-                let _ = _tray.set_tooltip(Some(new_state.tooltip()));
-                let _ = _tray.set_icon(Some(new_state.icon()));
-                status_item.set_text(new_state.status_text());
-                last_state = new_state;
-            }
-        }
-
-        if let Ok(event) = menu_rx.try_recv() {
-            if event.id == quit_id {
-                *control_flow = ControlFlow::Exit;
-            } else if event.id == log_id {
-                open_log(&log_file_path);
-            } else if event.id == login_id {
-                let now_checked = !login_item.is_checked();
-                login_item.set_checked(now_checked);
-                set_login_item(now_checked);
+        if let tao::event::Event::UserEvent(ue) = &event {
+            match ue {
+                UserEvent::StateChanged => {
+                    let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
+                    if new_state != last_state {
+                        let _ = _tray.set_tooltip(Some(new_state.tooltip()));
+                        let _ = _tray.set_icon(Some(new_state.icon()));
+                        status_item.set_text(new_state.status_text());
+                        last_state = new_state;
+                    }
+                }
+                UserEvent::Menu(me) => {
+                    if me.id == quit_id {
+                        *control_flow = ControlFlow::Exit;
+                    } else if me.id == log_id {
+                        open_log(&log_file_path);
+                    } else if me.id == login_id {
+                        if set_login_item(!login_checked) {
+                            login_checked = !login_checked;
+                            login_item.set_checked(login_checked);
+                        }
+                    }
+                }
             }
         }
     });

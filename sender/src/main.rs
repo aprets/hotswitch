@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
@@ -81,6 +82,8 @@ impl AppState {
 #[derive(Debug)]
 enum UserEvent {
     StateChanged,
+    CaptureBlocked,
+    Menu(tray_icon::menu::MenuEvent),
 }
 
 fn make_dot_icon(r: u8, g: u8, b: u8) -> Icon {
@@ -173,14 +176,15 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn set_login_item(enabled: bool, target_addr: &str) {
+fn set_login_item(enabled: bool, target_addr: &str) -> bool {
     let path = launch_agent_path();
+    eprintln!("set_login_item: enabled={enabled}, path={}", path.display());
     if enabled {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Failed to get current exe path: {e}");
-                return;
+                return false;
             }
         };
         let exe_escaped = xml_escape(&exe.display().to_string());
@@ -207,9 +211,16 @@ fn set_login_item(enabled: bool, target_addr: &str) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&path, plist);
+        match std::fs::write(&path, plist) {
+            Ok(()) => { eprintln!("wrote launch agent: {}", path.display()); true }
+            Err(e) => { eprintln!("failed to write launch agent: {e}"); false }
+        }
     } else {
-        let _ = std::fs::remove_file(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => { eprintln!("failed to remove launch agent: {e}"); false }
+        }
     }
 }
 
@@ -219,6 +230,8 @@ fn main() {
     let target_addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "10.0.0.100:24801".to_string());
+
+    eprintln!("hotswitch sender starting, target: {target_addr}");
 
     let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind UDP socket");
     socket
@@ -245,7 +258,8 @@ fn main() {
     let accum_dy = Arc::new(std::sync::Mutex::new(0.0f64));
 
     // Tao event loop
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    event_loop.set_activation_policy(ActivationPolicy::Accessory);
     let proxy = event_loop.create_proxy();
 
     // Helper to recompute and store combined AppState
@@ -268,6 +282,7 @@ fn main() {
 
     // --- CGEventTap setup ---
     let cap = capturing.clone();
+    let rc_tap = receiver_connected.clone();
     let sock = socket.try_clone().expect("Failed to clone socket");
     let keys = held_keys.clone();
     let adx = accum_dx.clone();
@@ -315,8 +330,13 @@ fn main() {
                     let ctrl_held = flags.contains(CGEventFlags::CGEventFlagControl);
                     if ctrl_held || !HOTKEY_REQUIRES_CTRL {
                         let was_capturing = cap.load(Ordering::SeqCst);
+                        if !was_capturing && !rc_tap.load(Ordering::SeqCst) {
+                            let _ = proxy_tap.send_event(UserEvent::CaptureBlocked);
+                            return CallbackResult::Drop;
+                        }
                         let now_capturing = !was_capturing;
                         cap.store(now_capturing, Ordering::SeqCst);
+                        eprintln!("capture {}", if now_capturing { "started" } else { "stopped" });
 
                         if now_capturing {
                             unsafe { CGAssociateMouseAndMouseCursorPosition(false); }
@@ -464,6 +484,7 @@ fn main() {
     let proxy_hb = proxy.clone();
     let compute_hb = compute_state.clone();
     thread::spawn(move || {
+        eprintln!("waiting for receiver...");
         let mut buf = [0u8; 8];
         let mut was_connected = false;
         let mut last_recv = Instant::now();
@@ -471,6 +492,7 @@ fn main() {
             match sock_rx.recv(&mut buf) {
                 Ok(n) if Event::from_bytes(&buf[..n]).is_some() => {
                     if !was_connected {
+                        eprintln!("receiver connected");
                         rc.store(true, Ordering::SeqCst);
                         was_connected = true;
                         compute_hb();
@@ -481,6 +503,7 @@ fn main() {
                 _ => {}
             }
             if was_connected && last_recv.elapsed().as_secs() > 3 {
+                eprintln!("receiver disconnected");
                 rc.store(false, Ordering::SeqCst);
                 was_connected = false;
                 compute_hb();
@@ -529,6 +552,11 @@ fn main() {
         &quit_item,
     ]);
 
+    let menu_proxy = proxy.clone();
+    MenuEvent::set_event_handler(Some(move |evt| {
+        let _ = menu_proxy.send_event(UserEvent::Menu(evt));
+    }));
+
     let initial_state = AppState::Waiting;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -537,42 +565,64 @@ fn main() {
         .build()
         .expect("Failed to create tray icon");
 
-    let menu_rx = MenuEvent::receiver();
     let log_id = log_item.id().clone();
     let login_id = login_item.id().clone();
     let quit_id = quit_item.id().clone();
     let addr_for_login = target_addr.clone();
+    let mut login_checked = is_login_item();
 
     let mut last_state = initial_state;
+    let mut flash_until: Option<Instant> = None;
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = match flash_until {
+            Some(deadline) if deadline > Instant::now() => ControlFlow::WaitUntil(deadline),
+            _ => ControlFlow::Wait,
+        };
 
-        // Handle user events (state changes from background threads)
-        if let tao::event::Event::UserEvent(UserEvent::StateChanged) = &event {
-            let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
-            if new_state != last_state {
-                let _ = tray.set_tooltip(Some(new_state.tooltip()));
-                let _ = tray.set_icon(Some(new_state.icon()));
-                status_item.set_text(new_state.status_text());
-                last_state = new_state;
+        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) = &event {
+            if flash_until.take().is_some() {
+                let _ = tray.set_icon(Some(last_state.icon()));
+                let _ = tray.set_tooltip(Some(last_state.tooltip()));
             }
         }
 
-        // Handle menu events
-        if let Ok(event) = menu_rx.try_recv() {
-            if event.id == quit_id {
-                if capturing.load(Ordering::SeqCst) {
-                    unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
-                    let _ = CGDisplay::show_cursor(&CGDisplay::main());
+        if let tao::event::Event::UserEvent(ue) = &event {
+            match ue {
+                UserEvent::StateChanged => {
+                    let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
+                    if new_state != last_state {
+                        if flash_until.is_none() {
+                            let _ = tray.set_tooltip(Some(new_state.tooltip()));
+                            let _ = tray.set_icon(Some(new_state.icon()));
+                        }
+                        status_item.set_text(new_state.status_text());
+                        last_state = new_state;
+                    }
                 }
-                *control_flow = ControlFlow::Exit;
-            } else if event.id == log_id {
-                let _ = std::process::Command::new("open").arg(&log_file_path).spawn();
-            } else if event.id == login_id {
-                let now_checked = !login_item.is_checked();
-                login_item.set_checked(now_checked);
-                set_login_item(now_checked, &addr_for_login);
+                UserEvent::CaptureBlocked => {
+                    let _ = tray.set_icon(Some(make_dot_icon(220, 38, 38)));
+                    let _ = tray.set_tooltip(Some("Hotswitch — No receiver"));
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    flash_until = Some(deadline);
+                    *control_flow = ControlFlow::WaitUntil(deadline);
+                }
+                UserEvent::Menu(me) => {
+                    if me.id == quit_id {
+                        if capturing.load(Ordering::SeqCst) {
+                            unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
+                            let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                        }
+                        *control_flow = ControlFlow::Exit;
+                    } else if me.id == log_id {
+                        let _ = std::process::Command::new("open").arg("-t").arg(&log_file_path).spawn();
+                    } else if me.id == login_id {
+                        if set_login_item(!login_checked, &addr_for_login) {
+                            login_checked = !login_checked;
+                            login_item.set_checked(login_checked);
+                        }
+                    }
+                }
             }
         }
     });
