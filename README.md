@@ -95,6 +95,10 @@ hotswitch/
   receiver/       Windows receiver (UDP + SendInput + tray icon)
 ```
 
+## Acknowledgements
+
+Huge thanks to [Moonlight](https://github.com/moonlight-stream/moonlight-qt)/[Sunshine](https://github.com/LizardByte/Sunshine) and [LAN Mouse](https://github.com/feschber/lan-mouse). This project wouldn't exist without their implementations, which were invaluable references for the input handling.
+
 ## License
 
 [MIT](LICENSE)
