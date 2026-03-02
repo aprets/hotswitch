@@ -178,12 +178,45 @@ impl AppState {
 #[derive(Debug)]
 enum UserEvent {
     StateChanged,
+    UpdateAvailable(String),
     Menu(tray_icon::menu::MenuEvent),
 }
 
 fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
     let (rgba, sz) = hotswitch_proto::icon::make_icon_rgba(r, g, b, filled);
     Icon::from_rgba(rgba, sz, sz).unwrap()
+}
+
+fn check_for_update() -> Option<String> {
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner("aprets")
+        .repo_name("hotswitch")
+        .build()
+        .ok()?
+        .fetch()
+        .ok()?;
+    let latest = releases.first()?;
+    if self_update::version::bump_is_greater(
+        self_update::cargo_crate_version!(),
+        &latest.version,
+    )
+    .unwrap_or(false)
+    {
+        Some(latest.version.clone())
+    } else {
+        None
+    }
+}
+
+fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("aprets")
+        .repo_name("hotswitch")
+        .bin_name("hotswitch-receiver")
+        .current_version(self_update::cargo_crate_version!())
+        .build()?
+        .update()?;
+    Ok(status)
 }
 
 // --- Log file ---
@@ -304,11 +337,10 @@ fn set_login_item(enabled: bool) -> bool {
         };
         unsafe { RegSetValueExW(hkey, &value_name, 0, REG_SZ, Some(bytes)).is_ok() }
     } else {
-        // Already absent is fine
+        use windows::Win32::Foundation::{ERROR_SUCCESS, ERROR_FILE_NOT_FOUND};
         match unsafe { RegDeleteValueW(hkey, &value_name) } {
-            Ok(()) => true,
-            Err(e) if e.code() == windows::core::HRESULT::from_win32(2) => true, // ERROR_FILE_NOT_FOUND
-            Err(e) => { eprintln!("failed to remove registry value: {e}"); false }
+            ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => true,
+            e => { eprintln!("failed to remove registry value: {e:?}"); false }
         }
     };
     unsafe { let _ = RegCloseKey(hkey); }
@@ -438,6 +470,17 @@ fn main() {
     });
 
     // --- Tray icon setup + event loop ---
+    let update_item = MenuItem::new("Check for Updates", true, None);
+    {
+        let proxy = proxy.clone();
+        thread::spawn(move || {
+            if let Some(ver) = check_for_update() {
+                eprintln!("update available: v{ver}");
+                let _ = proxy.send_event(UserEvent::UpdateAvailable(ver));
+            }
+        });
+    }
+
     let menu = Menu::new();
     let status_item = MenuItem::new(AppState::Listening.status_text(), false, None);
     let log_item = MenuItem::new("Show Log", true, None);
@@ -446,6 +489,7 @@ fn main() {
     let _ = menu.append_items(&[
         &status_item,
         &PredefinedMenuItem::separator(),
+        &update_item,
         &log_item,
         &login_item,
         &PredefinedMenuItem::separator(),
@@ -467,6 +511,7 @@ fn main() {
         .build()
         .expect("Failed to create tray icon");
 
+    let update_id = update_item.id().clone();
     let log_id = log_item.id().clone();
     let login_id = login_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -489,9 +534,30 @@ fn main() {
                         last_state = new_state;
                     }
                 }
+                UserEvent::UpdateAvailable(ver) => {
+                    update_item.set_text(format!("Update to v{ver}"));
+                }
                 UserEvent::Menu(me) => {
                     if me.id == quit_id {
                         *control_flow = ControlFlow::Exit;
+                    } else if me.id == update_id {
+                        update_item.set_text("Updating...");
+                        update_item.set_enabled(false);
+                        match apply_update() {
+                            Ok(status) => {
+                                eprintln!("update result: {status}");
+                                if status.updated() {
+                                    update_item.set_text("Updated — restart to apply");
+                                } else {
+                                    update_item.set_text("Already up to date");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("update failed: {e}");
+                                update_item.set_text("Update failed");
+                            }
+                        }
+                        update_item.set_enabled(true);
                     } else if me.id == log_id {
                         open_log(&log_file_path);
                     } else if me.id == login_id {

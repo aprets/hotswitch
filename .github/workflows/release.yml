@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-sender:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p hotswitch-sender
+      - run: tar -czf hotswitch-sender-aarch64-apple-darwin.tar.gz -C target/release hotswitch-sender
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotswitch-sender-macos
+          path: hotswitch-sender-aarch64-apple-darwin.tar.gz
+
+  build-receiver:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p hotswitch-receiver
+      - run: Compress-Archive -Path target/release/hotswitch-receiver.exe -DestinationPath hotswitch-receiver-x86_64-pc-windows-msvc.zip
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotswitch-receiver-windows
+          path: hotswitch-receiver-x86_64-pc-windows-msvc.zip
+
+  release:
+    needs: [build-sender, build-receiver]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

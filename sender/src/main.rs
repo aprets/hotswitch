@@ -83,12 +83,45 @@ impl AppState {
 enum UserEvent {
     StateChanged,
     CaptureBlocked,
+    UpdateAvailable(String),
     Menu(tray_icon::menu::MenuEvent),
 }
 
 fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
     let (rgba, sz) = hotswitch_proto::icon::make_icon_rgba(r, g, b, filled);
     Icon::from_rgba(rgba, sz, sz).unwrap()
+}
+
+fn check_for_update() -> Option<String> {
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner("aprets")
+        .repo_name("hotswitch")
+        .build()
+        .ok()?
+        .fetch()
+        .ok()?;
+    let latest = releases.first()?;
+    if self_update::version::bump_is_greater(
+        self_update::cargo_crate_version!(),
+        &latest.version,
+    )
+    .unwrap_or(false)
+    {
+        Some(latest.version.clone())
+    } else {
+        None
+    }
+}
+
+fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("aprets")
+        .repo_name("hotswitch")
+        .bin_name("hotswitch-sender")
+        .current_version(self_update::cargo_crate_version!())
+        .build()?
+        .update()?;
+    Ok(status)
 }
 
 fn map_mouse_button(event_type: &CGEventType, ev: &CGEvent) -> Option<(u8, bool)> {
@@ -522,6 +555,17 @@ fn main() {
     });
 
     // --- Tray icon setup + event loop ---
+    let update_item = MenuItem::new("Check for Updates", true, None);
+    {
+        let proxy = proxy.clone();
+        thread::spawn(move || {
+            if let Some(ver) = check_for_update() {
+                eprintln!("update available: v{ver}");
+                let _ = proxy.send_event(UserEvent::UpdateAvailable(ver));
+            }
+        });
+    }
+
     let menu = Menu::new();
     let status_item = MenuItem::new(AppState::Waiting.status_text(), false, None);
     let log_item = MenuItem::new("Show Log", true, None);
@@ -530,6 +574,7 @@ fn main() {
     let _ = menu.append_items(&[
         &status_item,
         &PredefinedMenuItem::separator(),
+        &update_item,
         &log_item,
         &login_item,
         &PredefinedMenuItem::separator(),
@@ -551,6 +596,7 @@ fn main() {
         .build()
         .expect("Failed to create tray icon");
 
+    let update_id = update_item.id().clone();
     let log_id = log_item.id().clone();
     let login_id = login_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -588,6 +634,9 @@ fn main() {
                         last_state = new_state;
                     }
                 }
+                UserEvent::UpdateAvailable(ver) => {
+                    update_item.set_text(format!("Update to v{ver}"));
+                }
                 UserEvent::CaptureBlocked => {
                     let _ = tray.set_icon_with_as_template(Some(make_icon(220, 38, 38, true)), false);
                     let _ = tray.set_tooltip(Some("Hotswitch — No receiver"));
@@ -602,6 +651,24 @@ fn main() {
                             let _ = CGDisplay::show_cursor(&CGDisplay::main());
                         }
                         *control_flow = ControlFlow::Exit;
+                    } else if me.id == update_id {
+                        update_item.set_text("Updating...");
+                        update_item.set_enabled(false);
+                        match apply_update() {
+                            Ok(status) => {
+                                eprintln!("update result: {status}");
+                                if status.updated() {
+                                    update_item.set_text("Updated — restart to apply");
+                                } else {
+                                    update_item.set_text("Already up to date");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("update failed: {e}");
+                                update_item.set_text("Update failed");
+                            }
+                        }
+                        update_item.set_enabled(true);
                     } else if me.id == log_id {
                         let _ = std::process::Command::new("open").arg("-t").arg(&log_file_path).spawn();
                     } else if me.id == login_id {
