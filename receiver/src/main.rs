@@ -264,8 +264,6 @@ fn open_log(path: &PathBuf) {
     let cmd = "notepad";
     #[cfg(target_os = "macos")]
     let cmd = "open";
-    #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
     let _ = std::process::Command::new(cmd).arg(path).spawn();
 }
 
