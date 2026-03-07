@@ -1,4 +1,4 @@
-const ICON_SIZE: u32 = 64;
+const ICON_SIZE: u32 = 256;
 
 /// Returns `(rgba_data, size)` for a circle-with-arrows tray icon.
 /// Use `filled=false` for an outline ring, `filled=true` for a solid circle.
