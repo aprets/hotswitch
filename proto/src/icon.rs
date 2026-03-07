@@ -1,9 +1,7 @@
-const ICON_SIZE: u32 = 256;
-
 /// Returns `(rgba_data, size)` for a circle-with-arrows tray icon.
 /// Use `filled=false` for an outline ring, `filled=true` for a solid circle.
-pub fn make_icon_rgba(r: u8, g: u8, b: u8, filled: bool) -> (Vec<u8>, u32) {
-    let sz = ICON_SIZE;
+pub fn make_icon_rgba(r: u8, g: u8, b: u8, filled: bool, size: u32) -> (Vec<u8>, u32) {
+    let sz = size;
     let mut rgba = vec![0u8; (sz * sz * 4) as usize];
     let cx = sz as f32 / 2.0;
     let cy = cx;

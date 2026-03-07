@@ -182,8 +182,14 @@ enum UserEvent {
     Menu(tray_icon::menu::MenuEvent),
 }
 
+fn icon_size() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    if size > 0 { (size as u32) * 2 } else { 32 }
+}
+
 fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
-    let (rgba, sz) = hotswitch_proto::icon::make_icon_rgba(r, g, b, filled);
+    let (rgba, sz) = hotswitch_proto::icon::make_icon_rgba(r, g, b, filled, icon_size());
     Icon::from_rgba(rgba, sz, sz).unwrap()
 }
 
@@ -555,15 +561,19 @@ fn main() {
                     if me.id == quit_id {
                         *control_flow = ControlFlow::Exit;
                     } else if me.id == update_id {
+                        let exe = std::env::current_exe().expect("Failed to get current exe path");
                         update_item.set_text("Updating...");
                         update_item.set_enabled(false);
                         match apply_update() {
                             Ok(status) => {
                                 eprintln!("update result: {status}");
                                 if status.updated() {
-                                    let exe = std::env::current_exe().expect("Failed to get current exe path");
                                     let args: Vec<String> = std::env::args().skip(1).collect();
-                                    let _ = std::process::Command::new(exe).args(&args).spawn();
+                                    eprintln!("relaunching: {exe:?} {args:?}");
+                                    match std::process::Command::new(&exe).args(&args).spawn() {
+                                        Ok(_) => {},
+                                        Err(e) => eprintln!("relaunch failed: {e}"),
+                                    }
                                     *control_flow = ControlFlow::Exit;
                                     return;
                                 } else {
