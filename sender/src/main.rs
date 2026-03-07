@@ -6,7 +6,8 @@ use core_graphics::{
         CGEventTapPlacement, CGEventTapProxy, CGEventType, EventField,
     },
 };
-use hotswitch_proto::Event;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use hotswitch_proto::{audio, Event};
 use std::{
     collections::HashSet,
     ffi::c_void,
@@ -244,6 +245,75 @@ fn set_login_item(enabled: bool, target_addr: &str) -> bool {
     }
 }
 
+fn start_audio_playback() {
+    thread::spawn(move || {
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("audio: no output device");
+                return;
+            }
+        };
+        let device_name = device.name().unwrap_or_default();
+        eprintln!("audio: playing on {device_name}");
+
+        let config = cpal::StreamConfig {
+            channels: audio::CHANNELS,
+            sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(audio::SAMPLE_RATE as usize);
+
+        let stream = device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                for sample in data.iter_mut() {
+                    *sample = consumer.pop().unwrap_or(0.0);
+                }
+            },
+            |err| eprintln!("audio: playback error: {err}"),
+            None,
+        );
+
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("audio: failed to build output stream: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            eprintln!("audio: failed to start playback: {e}");
+            return;
+        }
+
+        let socket = match UdpSocket::bind(format!("0.0.0.0:{}", audio::AUDIO_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("audio: failed to bind on port {}: {e}", audio::AUDIO_PORT);
+                return;
+            }
+        };
+        eprintln!("audio: listening on port {}", audio::AUDIO_PORT);
+
+        let mut buf = [0u8; 1500];
+        loop {
+            let n = match socket.recv(&mut buf) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if let Some((_channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
+                for sample in audio::raw_to_samples(raw) {
+                    let _ = producer.push(sample);
+                }
+            }
+        }
+    });
+}
+
 fn main() {
     let log_file_path = redirect_stdio_to_log();
 
@@ -258,6 +328,8 @@ fn main() {
         .connect(&target_addr)
         .expect("Failed to connect UDP socket");
     socket.set_nonblocking(true).ok();
+
+    start_audio_playback();
 
     unsafe {
         let conn = _CGSDefaultConnection();

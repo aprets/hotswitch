@@ -7,9 +7,12 @@ Minimal software KVM for sharing a Mac's keyboard and mouse with a Windows PC ov
 ```
 Mac (sender)                  UDP / LAN              Windows (receiver)
 CGEventTap ───────────────> 3–5 byte datagrams ────> SendInput
+                    <──── audio (PCM over UDP) <──── WASAPI loopback
 ```
 
 The sender captures keyboard and mouse events on macOS via `CGEventTap`, serializes them into UDP packets, and sends them to the receiver. The receiver injects them as native Windows input via `SendInput` with hardware scancodes.
+
+Audio flows in the reverse direction: the receiver captures Windows system audio via WASAPI loopback and streams raw PCM over UDP back to the sender, which plays it through the Mac's default output device.
 
 When capturing, the Mac cursor is hidden and locked. Mouse deltas and key events are forwarded to Windows. A key-sync packet every 100ms guards against dropped UDP key-up packets.
 
@@ -66,25 +69,21 @@ cargo test -p hotswitch-proto
 
 ## Releasing
 
-Tag a version and push. GitHub Actions builds both binaries and publishes a release.
-
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
+Every push to `main` triggers a GitHub Actions build that publishes both binaries as a release. The version is derived from the commit timestamp.
 
 ## Protocol
 
 Plain UDP, 1-byte type tag, big-endian, no framing:
 
-| Event | Bytes | Layout |
-|---|---|---|
-| Mouse move | 5 | `01 dx:i16 dy:i16` |
-| Mouse button | 3 | `02 button:u8 pressed:u8` |
-| Scroll | 5 | `03 dx:i16 dy:i16` |
-| Key event | 4 | `04 cgkeycode:u16 pressed:u8` |
-| Key sync | 2+2n | `05 count:u8 [cgkeycode:u16]...` |
-| Heartbeat | 1 | `06` |
+| Event | Port | Bytes | Layout |
+|---|---|---|---|
+| Mouse move | 24801 | 5 | `01 dx:i16 dy:i16` |
+| Mouse button | 24801 | 3 | `02 button:u8 pressed:u8` |
+| Scroll | 24801 | 5 | `03 dx:i16 dy:i16` |
+| Key event | 24801 | 4 | `04 cgkeycode:u16 pressed:u8` |
+| Key sync | 24801 | 2+2n | `05 count:u8 [cgkeycode:u16]...` |
+| Heartbeat | 24801 | 1 | `06` |
+| Audio | 24802 | 3+4n | `07 channels:u16 [sample:f32le]...` |
 
 ## Project structure
 
@@ -97,7 +96,7 @@ hotswitch/
 
 ## Acknowledgements
 
-Huge thanks to [Moonlight](https://github.com/moonlight-stream/moonlight-qt)/[Sunshine](https://github.com/LizardByte/Sunshine) and [LAN Mouse](https://github.com/feschber/lan-mouse). This project wouldn't exist without their implementations, which were invaluable references for the input handling.
+Huge thanks to [Moonlight](https://github.com/moonlight-stream/moonlight-qt)/[Sunshine](https://github.com/LizardByte/Sunshine) and [LAN Mouse](https://github.com/feschber/lan-mouse). This project wouldn't exist without their implementations, which were invaluable references for the input and audio handling. Audio streaming was also informed by [Beer](https://github.com/alii/beer) and [W11-to-Mac-Sound-Stream](https://github.com/egehandogan35/w11-to-mac-sound-stream).
 
 ## License
 

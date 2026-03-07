@@ -1,8 +1,9 @@
-use hotswitch_proto::{keymap, Event};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use hotswitch_proto::{audio, keymap, Event};
 use std::collections::HashSet;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -362,6 +363,75 @@ fn is_login_item() -> bool { false }
 #[cfg(not(windows))]
 fn set_login_item(_enabled: bool) -> bool { true }
 
+fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let host = cpal::default_host();
+
+        // WASAPI loopback: use the default *output* device as an input source
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("audio: no output device for loopback capture");
+                return;
+            }
+        };
+        let device_name = device.name().unwrap_or_default();
+        eprintln!("audio: capturing from {device_name}");
+
+        let config = cpal::StreamConfig {
+            channels: audio::CHANNELS,
+            sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                eprintln!("audio: failed to bind socket: {e}");
+                return;
+            }
+        };
+
+        let sock = socket.clone();
+        let run = running.clone();
+        let stream = device.build_input_stream(
+            &config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if !run.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut buf = [0u8; 1472];
+                for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
+                    let len = audio::audio_to_bytes(audio::CHANNELS, chunk, &mut buf);
+                    let _ = sock.send_to(&buf[..len], target);
+                }
+            },
+            |err| eprintln!("audio: stream error: {err}"),
+            None,
+        );
+
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("audio: failed to build input stream: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            eprintln!("audio: failed to start stream: {e}");
+            return;
+        }
+
+        eprintln!("audio: streaming to {target}");
+        while running.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        drop(stream);
+        eprintln!("audio: stopped");
+    });
+}
+
 fn main() {
     let log_file_path = redirect_stdio_to_log();
 
@@ -401,7 +471,9 @@ fn main() {
         let mut held_keys: HashSet<u16> = HashSet::new();
         let mut sender_connected = false;
         let mut last_heartbeat = Instant::now();
-        let mut sender_addr = None;
+        let mut sender_addr: Option<SocketAddr> = None;
+        let audio_running = Arc::new(AtomicBool::new(false));
+        let mut audio_target: Option<SocketAddr> = None;
 
         let release_all_keys = |keys: &mut HashSet<u16>| {
             for &k in keys.iter() {
@@ -420,6 +492,8 @@ fn main() {
                 {
                     if sender_connected && last_heartbeat.elapsed().as_secs() > 5 {
                         release_all_keys(&mut held_keys);
+                        audio_running.store(false, Ordering::SeqCst);
+                        audio_target = None;
                         eprintln!("WARNING: sender disconnected");
                         sender_connected = false;
                         state.store(AppState::Listening as u8, Ordering::SeqCst);
@@ -436,6 +510,7 @@ fn main() {
             if !sender_connected || sender_addr != Some(src) {
                 if sender_connected {
                     release_all_keys(&mut held_keys);
+                    audio_running.store(false, Ordering::SeqCst);
                 }
                 println!("sender connected from {src}");
                 sender_addr = Some(src);
@@ -443,6 +518,15 @@ fn main() {
                 last_heartbeat = Instant::now();
                 state.store(AppState::Connected as u8, Ordering::SeqCst);
                 let _ = net_proxy.send_event(UserEvent::StateChanged);
+
+                let target = SocketAddr::new(src.ip(), audio::AUDIO_PORT);
+                if audio_target != Some(target) {
+                    audio_running.store(false, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(50));
+                    audio_running.store(true, Ordering::SeqCst);
+                    start_audio_capture(target, audio_running.clone());
+                    audio_target = Some(target);
+                }
             }
 
             match Event::from_bytes(&buf[..n]) {
