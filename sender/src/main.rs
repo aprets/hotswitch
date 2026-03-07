@@ -672,7 +672,11 @@ fn main() {
                             Ok(status) => {
                                 eprintln!("update result: {status}");
                                 if status.updated() {
-                                    update_item.set_text("Updated, restart to apply");
+                                    let exe = std::env::current_exe().expect("Failed to get current exe path");
+                                    let args: Vec<String> = std::env::args().skip(1).collect();
+                                    let _ = std::process::Command::new(exe).args(&args).spawn();
+                                    *control_flow = ControlFlow::Exit;
+                                    return;
                                 } else {
                                     update_item.set_text("Already up to date");
                                     reset_update_at = Some(Instant::now() + Duration::from_secs(5));
