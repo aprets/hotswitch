@@ -679,13 +679,17 @@ fn main() {
                                     return;
                                 } else {
                                     update_item.set_text("Already up to date");
-                                    reset_update_at = Some(Instant::now() + Duration::from_secs(5));
+                                    let deadline = Instant::now() + Duration::from_secs(5);
+                                    reset_update_at = Some(deadline);
+                                    *control_flow = ControlFlow::WaitUntil(deadline);
                                 }
                             }
                             Err(e) => {
                                 eprintln!("update failed: {e}");
                                 update_item.set_text("Update failed");
-                                reset_update_at = Some(Instant::now() + Duration::from_secs(5));
+                                let deadline = Instant::now() + Duration::from_secs(5);
+                                reset_update_at = Some(deadline);
+                                *control_flow = ControlFlow::WaitUntil(deadline);
                             }
                         }
                         update_item.set_enabled(true);

@@ -8,7 +8,7 @@ pub fn make_icon_rgba(r: u8, g: u8, b: u8, filled: bool) -> (Vec<u8>, u32) {
     let cx = sz as f32 / 2.0;
     let cy = cx;
     let outer_r = cx - 1.0;
-    let ring_w: f32 = 3.0;
+    let ring_w = sz as f32 / 16.0;
 
     for y in 0..sz {
         for x in 0..sz {
@@ -84,18 +84,25 @@ fn draw_arrows(rgba: &mut [u8], sz: u32, color: &[u8; 4], cutout: bool) {
     };
 
     let fill_tri = |rgba: &mut [u8], pts: [(f32, f32); 3]| {
-        let min_x = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor() as i32;
-        let max_x = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as i32;
-        let min_y = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor() as i32;
-        let max_y = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as i32;
+        let min_x = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor() as i32 - 1;
+        let max_x = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as i32 + 1;
+        let min_y = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor() as i32 - 1;
+        let max_y = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as i32 + 1;
+        let edge_len = |i: usize| {
+            let j = (i + 1) % 3;
+            let (dx, dy) = (pts[j].0 - pts[i].0, pts[j].1 - pts[i].1);
+            (dx * dx + dy * dy).sqrt()
+        };
+        let (l0, l1, l2) = (edge_len(0), edge_len(1), edge_len(2));
         for py in min_y..=max_y {
             for px in min_x..=max_x {
                 let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
-                let d0 = (pts[1].0 - pts[0].0) * (fy - pts[0].1) - (pts[1].1 - pts[0].1) * (fx - pts[0].0);
-                let d1 = (pts[2].0 - pts[1].0) * (fy - pts[1].1) - (pts[2].1 - pts[1].1) * (fx - pts[1].0);
-                let d2 = (pts[0].0 - pts[2].0) * (fy - pts[2].1) - (pts[0].1 - pts[2].1) * (fx - pts[2].0);
-                let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
-                if inside { set_px(rgba, px, py, 1.0); }
+                let mut d0 = ((pts[1].0 - pts[0].0) * (fy - pts[0].1) - (pts[1].1 - pts[0].1) * (fx - pts[0].0)) / l0;
+                let mut d1 = ((pts[2].0 - pts[1].0) * (fy - pts[1].1) - (pts[2].1 - pts[1].1) * (fx - pts[1].0)) / l1;
+                let mut d2 = ((pts[0].0 - pts[2].0) * (fy - pts[2].1) - (pts[0].1 - pts[2].1) * (fx - pts[2].0)) / l2;
+                if d0 + d1 + d2 < 0.0 { d0 = -d0; d1 = -d1; d2 = -d2; }
+                let a = (d0.min(d1).min(d2) + 0.5).clamp(0.0, 1.0);
+                if a > 0.0 { set_px(rgba, px, py, a); }
             }
         }
     };
