@@ -1,8 +1,8 @@
-name: Release
+name: Build & Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
@@ -10,9 +10,15 @@ permissions:
 jobs:
   build-sender:
     runs-on: macos-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - id: v
+        run: echo "version=$(date -u +'%Y.%-m%d.%-H%M')" >> "$GITHUB_OUTPUT"
+      - run: sed -i '' "s/^version = .*/version = \"${{ steps.v.outputs.version }}\"/" sender/Cargo.toml
+      - run: cargo test -p hotswitch-proto
       - run: cargo build --release -p hotswitch-sender
       - run: tar -czf hotswitch-sender-aarch64-apple-darwin.tar.gz -C target/release hotswitch-sender
       - uses: actions/upload-artifact@v4
@@ -25,6 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: (Get-Content receiver/Cargo.toml) -replace '^version = .*', "version = `"$(Get-Date -AsUTC -Format 'yyyy.Mdd.Hmm')`"" | Set-Content receiver/Cargo.toml
+        shell: pwsh
       - run: cargo build --release -p hotswitch-receiver
       - run: Compress-Archive -Path target/release/hotswitch-receiver.exe -DestinationPath hotswitch-receiver-x86_64-pc-windows-msvc.zip
         shell: pwsh
@@ -43,4 +51,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.build-sender.outputs.version }}
           files: artifacts/*

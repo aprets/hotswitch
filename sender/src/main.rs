@@ -119,6 +119,9 @@ fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
         .repo_name("hotswitch")
         .bin_name("hotswitch-sender")
         .current_version(self_update::cargo_crate_version!())
+        .no_confirm(true)
+        .show_download_progress(false)
+        .show_output(false)
         .build()?
         .update()?;
     Ok(status)
@@ -605,18 +608,29 @@ fn main() {
 
     let mut last_state = initial_state;
     let mut flash_until: Option<Instant> = None;
+    let mut reset_update_at: Option<Instant> = None;
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = match flash_until {
-            Some(deadline) if deadline > Instant::now() => ControlFlow::WaitUntil(deadline),
+        let next_wake = [flash_until, reset_update_at]
+            .iter()
+            .filter_map(|t| *t)
+            .min();
+        *control_flow = match next_wake {
+            Some(d) if d > Instant::now() => ControlFlow::WaitUntil(d),
             _ => ControlFlow::Wait,
         };
 
         if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) = &event {
-            if flash_until.take().is_some() {
+            let now = Instant::now();
+            if flash_until.map_or(false, |d| now >= d) {
+                flash_until = None;
                 let (icon, tmpl) = last_state.icon();
                 let _ = tray.set_icon_with_as_template(Some(icon), tmpl);
                 let _ = tray.set_tooltip(Some(last_state.tooltip()));
+            }
+            if reset_update_at.map_or(false, |d| now >= d) {
+                reset_update_at = None;
+                update_item.set_text("Check for Updates");
             }
         }
 
@@ -658,14 +672,16 @@ fn main() {
                             Ok(status) => {
                                 eprintln!("update result: {status}");
                                 if status.updated() {
-                                    update_item.set_text("Updated — restart to apply");
+                                    update_item.set_text("Updated, restart to apply");
                                 } else {
                                     update_item.set_text("Already up to date");
+                                    reset_update_at = Some(Instant::now() + Duration::from_secs(5));
                                 }
                             }
                             Err(e) => {
                                 eprintln!("update failed: {e}");
                                 update_item.set_text("Update failed");
+                                reset_update_at = Some(Instant::now() + Duration::from_secs(5));
                             }
                         }
                         update_item.set_enabled(true);

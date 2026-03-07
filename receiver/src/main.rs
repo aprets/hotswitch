@@ -214,6 +214,9 @@ fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
         .repo_name("hotswitch")
         .bin_name("hotswitch-receiver")
         .current_version(self_update::cargo_crate_version!())
+        .no_confirm(true)
+        .show_download_progress(false)
+        .show_output(false)
         .build()?
         .update()?;
     Ok(status)
@@ -518,9 +521,20 @@ fn main() {
     let mut login_checked = is_login_item();
 
     let mut last_state = initial_state;
+    let mut reset_update_at: Option<Instant> = None;
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = match reset_update_at {
+            Some(d) if d > Instant::now() => ControlFlow::WaitUntil(d),
+            _ => ControlFlow::Wait,
+        };
+
+        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) = &event {
+            if reset_update_at.map_or(false, |d| Instant::now() >= d) {
+                reset_update_at = None;
+                update_item.set_text("Check for Updates");
+            }
+        }
 
         if let tao::event::Event::UserEvent(ue) = &event {
             match ue {
@@ -547,14 +561,16 @@ fn main() {
                             Ok(status) => {
                                 eprintln!("update result: {status}");
                                 if status.updated() {
-                                    update_item.set_text("Updated — restart to apply");
+                                    update_item.set_text("Updated, restart to apply");
                                 } else {
                                     update_item.set_text("Already up to date");
+                                    reset_update_at = Some(Instant::now() + Duration::from_secs(5));
                                 }
                             }
                             Err(e) => {
                                 eprintln!("update failed: {e}");
                                 update_item.set_text("Update failed");
+                                reset_update_at = Some(Instant::now() + Duration::from_secs(5));
                             }
                         }
                         update_item.set_enabled(true);
