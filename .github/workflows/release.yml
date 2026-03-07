@@ -17,7 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - id: v
         run: echo "version=$(date -u +'%Y.%-m%d.%-H%M')" >> "$GITHUB_OUTPUT"
-      - run: sed -i '' "s/^version = .*/version = \"${{ steps.v.outputs.version }}\"/" sender/Cargo.toml
+      - run: sed -i '' '1,5s/^version = ".*"/version = "'"${{ steps.v.outputs.version }}"'"/' sender/Cargo.toml
       - run: cargo test -p hotswitch-proto
       - run: cargo build --release -p hotswitch-sender
       - run: tar -czf hotswitch-sender-aarch64-apple-darwin.tar.gz -C target/release hotswitch-sender
@@ -31,8 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: (Get-Content receiver/Cargo.toml) -replace '^version = .*', "version = `"$(Get-Date -AsUTC -Format 'yyyy.Mdd.Hmm')`"" | Set-Content receiver/Cargo.toml
-        shell: pwsh
+      - id: v
+        run: echo "version=$(date -u +'%Y.%-m%d.%-H%M')" >> "$GITHUB_OUTPUT"
+      - run: sed -i '1,5s/^version = ".*"/version = "'"${{ steps.v.outputs.version }}"'"/' receiver/Cargo.toml
       - run: cargo build --release -p hotswitch-receiver
       - run: Compress-Archive -Path target/release/hotswitch-receiver.exe -DestinationPath hotswitch-receiver-x86_64-pc-windows-msvc.zip
         shell: pwsh
