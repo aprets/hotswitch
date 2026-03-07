@@ -179,6 +179,7 @@ impl AppState {
 enum UserEvent {
     StateChanged,
     UpdateAvailable(String),
+    ResetUpdateText,
     Menu(tray_icon::menu::MenuEvent),
 }
 
@@ -368,7 +369,20 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:24801".to_string());
 
-    let socket = UdpSocket::bind(&listen_addr).expect("Failed to bind UDP socket");
+    let socket = {
+        let mut attempts = 0;
+        loop {
+            match UdpSocket::bind(&listen_addr) {
+                Ok(s) => break s,
+                Err(e) if attempts < 10 => {
+                    attempts += 1;
+                    eprintln!("bind attempt {attempts}/10 failed: {e}, retrying...");
+                    thread::sleep(Duration::from_millis(500));
+                }
+                Err(e) => panic!("Failed to bind UDP socket after {attempts} attempts: {e}"),
+            }
+        }
+    };
     socket.set_read_timeout(Some(Duration::from_secs(2))).ok();
     println!("hotswitch receiver listening on {listen_addr}");
 
@@ -527,20 +541,10 @@ fn main() {
     let mut login_checked = is_login_item();
 
     let mut last_state = initial_state;
-    let mut reset_update_at: Option<Instant> = None;
+    let reset_proxy = proxy.clone();
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = match reset_update_at {
-            Some(d) if d > Instant::now() => ControlFlow::WaitUntil(d),
-            _ => ControlFlow::Wait,
-        };
-
-        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) = &event {
-            if reset_update_at.map_or(false, |d| Instant::now() >= d) {
-                reset_update_at = None;
-                update_item.set_text("Check for Updates");
-            }
-        }
+        *control_flow = ControlFlow::Wait;
 
         if let tao::event::Event::UserEvent(ue) = &event {
             match ue {
@@ -556,6 +560,9 @@ fn main() {
                 }
                 UserEvent::UpdateAvailable(ver) => {
                     update_item.set_text(format!("Update to v{ver}"));
+                }
+                UserEvent::ResetUpdateText => {
+                    update_item.set_text("Check for Updates");
                 }
                 UserEvent::Menu(me) => {
                     if me.id == quit_id {
@@ -578,17 +585,21 @@ fn main() {
                                     return;
                                 } else {
                                     update_item.set_text("Already up to date");
-                                    let deadline = Instant::now() + Duration::from_secs(5);
-                                    reset_update_at = Some(deadline);
-                                    *control_flow = ControlFlow::WaitUntil(deadline);
+                                    let p = reset_proxy.clone();
+                                    thread::spawn(move || {
+                                        thread::sleep(Duration::from_secs(5));
+                                        let _ = p.send_event(UserEvent::ResetUpdateText);
+                                    });
                                 }
                             }
                             Err(e) => {
                                 eprintln!("update failed: {e}");
                                 update_item.set_text("Update failed");
-                                let deadline = Instant::now() + Duration::from_secs(5);
-                                reset_update_at = Some(deadline);
-                                *control_flow = ControlFlow::WaitUntil(deadline);
+                                let p = reset_proxy.clone();
+                                thread::spawn(move || {
+                                    thread::sleep(Duration::from_secs(5));
+                                    let _ = p.send_event(UserEvent::ResetUpdateText);
+                                });
                             }
                         }
                         update_item.set_enabled(true);
