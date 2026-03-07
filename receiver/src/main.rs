@@ -3,7 +3,7 @@ use hotswitch_proto::{audio, keymap, Event};
 use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -394,6 +394,8 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
 
         let sock = socket.clone();
         let run = running.clone();
+        let packets_sent = Arc::new(AtomicU64::new(0));
+        let pkt_count = packets_sent.clone();
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -404,6 +406,7 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
                 for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
                     let len = audio::audio_to_bytes(audio::CHANNELS, chunk, &mut buf);
                     let _ = sock.send_to(&buf[..len], target);
+                    pkt_count.fetch_add(1, Ordering::Relaxed);
                 }
             },
             |err| eprintln!("audio: stream error: {err}"),
@@ -424,8 +427,14 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         }
 
         eprintln!("audio: streaming to {target}");
+        let mut last_log = Instant::now();
         while running.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
+            if last_log.elapsed().as_secs() >= 5 {
+                let pkts = packets_sent.swap(0, Ordering::Relaxed);
+                eprintln!("audio: {pkts} pkts sent (5s)");
+                last_log = Instant::now();
+            }
         }
         drop(stream);
         eprintln!("audio: stopped");
@@ -511,6 +520,7 @@ fn main() {
                 if sender_connected {
                     release_all_keys(&mut held_keys);
                     audio_running.store(false, Ordering::SeqCst);
+                    audio_target = None;
                 }
                 println!("sender connected from {src}");
                 sender_addr = Some(src);

@@ -300,15 +300,30 @@ fn start_audio_playback() {
         eprintln!("audio: listening on port {}", audio::AUDIO_PORT);
 
         let mut buf = [0u8; 1500];
+        let mut packets: u64 = 0;
+        let mut dropped: u64 = 0;
+        let mut last_log = Instant::now();
+        let buf_capacity = audio::SAMPLE_RATE as usize;
         loop {
             let n = match socket.recv(&mut buf) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
             if let Some((_channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
+                packets += 1;
                 for sample in audio::raw_to_samples(raw) {
-                    let _ = producer.push(sample);
+                    if producer.push(sample).is_err() {
+                        dropped += 1;
+                    }
                 }
+            }
+            if last_log.elapsed().as_secs() >= 5 {
+                let buffered = buf_capacity - producer.slots();
+                let latency_ms = buffered as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
+                eprintln!("audio: {packets} pkts, buf {buffered}/{buf_capacity} ({latency_ms:.1}ms), {dropped} dropped");
+                packets = 0;
+                dropped = 0;
+                last_log = Instant::now();
             }
         }
     });
