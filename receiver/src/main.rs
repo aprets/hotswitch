@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam_queue::ArrayQueue;
 use hotswitch_proto::{audio, keymap, Event};
 use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
@@ -14,18 +15,70 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
 };
+#[cfg(windows)]
+use windows::{
+    core::w,
+    Win32::{
+        Foundation::HANDLE,
+        System::Threading::{
+            AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+            AVRT_PRIORITY_HIGH,
+        },
+    },
+};
 
 const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
+const AUDIO_SEND_FRAMES: u32 = 96;
+const AUDIO_SEND_SAMPLES: usize = AUDIO_SEND_FRAMES as usize * audio::CHANNELS as usize;
+const AUDIO_SEND_QUEUE_CAPACITY: usize =
+    (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
+
+#[cfg(windows)]
+type MmcssHandle = HANDLE;
+#[cfg(not(windows))]
+type MmcssHandle = ();
+
+#[cfg(windows)]
+fn enable_mmcss_audio() -> Option<MmcssHandle> {
+    let mut task_index = 0;
+    let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) };
+    match handle {
+        Ok(handle) => {
+            let _ = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH) };
+            eprintln!("audio: MMCSS enabled");
+            Some(handle)
+        }
+        Err(e) => {
+            eprintln!("audio: failed to enable MMCSS: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn disable_mmcss_audio(handle: MmcssHandle) {
+    if let Err(e) = unsafe { AvRevertMmThreadCharacteristics(handle) } {
+        eprintln!("audio: failed to disable MMCSS: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_mmcss_audio() -> Option<MmcssHandle> {
+    None
+}
+
+#[cfg(not(windows))]
+fn disable_mmcss_audio(_handle: MmcssHandle) {}
 
 #[cfg(windows)]
 mod inject {
     use std::ops::BitOrAssign;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
         KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
         MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
         MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-        MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
+        MOUSEEVENTF_XUP, MOUSEINPUT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
@@ -191,7 +244,11 @@ enum UserEvent {
 fn icon_size() -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
-    if size > 0 { (size as u32) * 2 } else { 32 }
+    if size > 0 {
+        (size as u32) * 2
+    } else {
+        32
+    }
 }
 
 fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
@@ -208,11 +265,8 @@ fn check_for_update() -> Option<String> {
         .fetch()
         .ok()?;
     let latest = releases.first()?;
-    if self_update::version::bump_is_greater(
-        self_update::cargo_crate_version!(),
-        &latest.version,
-    )
-    .unwrap_or(false)
+    if self_update::version::bump_is_greater(self_update::cargo_crate_version!(), &latest.version)
+        .unwrap_or(false)
     {
         Some(latest.version.clone())
     } else {
@@ -328,12 +382,8 @@ fn set_login_item(enabled: bool) -> bool {
         let exe_str = exe.to_string_lossy().to_string();
         std::process::Command::new("schtasks")
             .args([
-                "/Create", "/F",
-                "/TN", TASK_NAME,
-                "/TR", &exe_str,
-                "/SC", "ONLOGON",
-                "/RL", "HIGHEST",
-                "/IT",
+                "/Create", "/F", "/TN", TASK_NAME, "/TR", &exe_str, "/SC", "ONLOGON", "/RL",
+                "HIGHEST", "/IT",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -352,12 +402,17 @@ fn set_login_item(enabled: bool) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_login_item() -> bool { false }
+fn is_login_item() -> bool {
+    false
+}
 #[cfg(not(windows))]
-fn set_login_item(_enabled: bool) -> bool { true }
+fn set_login_item(_enabled: bool) -> bool {
+    true
+}
 
 fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
     thread::spawn(move || {
+        let mmcss = enable_mmcss_audio();
         let host = cpal::default_host();
 
         // WASAPI loopback: use the default *output* device as an input source
@@ -365,6 +420,9 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
             Some(d) => d,
             None => {
                 eprintln!("audio: no output device for loopback capture");
+                if let Some(handle) = mmcss {
+                    disable_mmcss_audio(handle);
+                }
                 return;
             }
         };
@@ -381,6 +439,9 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 eprintln!("audio: failed to bind socket: {e}");
+                if let Some(handle) = mmcss {
+                    disable_mmcss_audio(handle);
+                }
                 return;
             }
         };
@@ -389,13 +450,16 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         let run = running.clone();
         let packets_sent = Arc::new(AtomicU64::new(0));
         let pkt_count = packets_sent.clone();
+        let queue_drops = Arc::new(AtomicU64::new(0));
+        let drop_count = queue_drops.clone();
         let next_seq = Arc::new(AtomicU32::new(0));
         let seq = next_seq.clone();
+        let sample_queue = Arc::new(ArrayQueue::<f32>::new(AUDIO_SEND_QUEUE_CAPACITY));
+        let queue = sample_queue.clone();
         let make_stream = |config: &cpal::StreamConfig| {
             let run = run.clone();
-            let sock = sock.clone();
-            let pkt_count = pkt_count.clone();
-            let seq = seq.clone();
+            let queue = queue.clone();
+            let drop_count = drop_count.clone();
             let mut last_callback_frames = 0u32;
             device.build_input_stream(
                 config,
@@ -413,13 +477,16 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
                     if !run.load(Ordering::Relaxed) {
                         return;
                     }
-                    let mut buf = [0u8; 1472];
-                    for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
-                        let packet_seq = seq.fetch_add(1, Ordering::Relaxed);
-                        let len =
-                            audio::audio_to_bytes(packet_seq, audio::CHANNELS, chunk, &mut buf);
-                        let _ = sock.send_to(&buf[..len], target);
-                        pkt_count.fetch_add(1, Ordering::Relaxed);
+
+                    for &sample in data {
+                        while queue.len() >= AUDIO_SEND_QUEUE_CAPACITY {
+                            if queue.pop().is_some() {
+                                drop_count.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                break;
+                            }
+                        }
+                        let _ = queue.push(sample);
                     }
                 },
                 |err| eprintln!("audio: stream error: {err}"),
@@ -458,20 +525,77 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
 
         if let Err(e) = stream.play() {
             eprintln!("audio: failed to start stream: {e}");
+            if let Some(handle) = mmcss {
+                disable_mmcss_audio(handle);
+            }
             return;
         }
 
         eprintln!("audio: streaming to {target}");
+        let pace_run = running.clone();
+        let pace_queue = sample_queue.clone();
+        let pace_sock = sock.clone();
+        let pace_seq = seq.clone();
+        let pace_pkts = pkt_count.clone();
+        thread::spawn(move || {
+            let send_interval =
+                Duration::from_secs_f64(AUDIO_SEND_FRAMES as f64 / audio::SAMPLE_RATE as f64);
+            let mut buf = [0u8; 1472];
+            let mut samples = [0f32; AUDIO_SEND_SAMPLES];
+            let mut next_send = Instant::now();
+
+            while pace_run.load(Ordering::Relaxed) {
+                let available = pace_queue.len();
+                if available == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                    next_send = Instant::now();
+                    continue;
+                }
+
+                let now = Instant::now();
+                if available < AUDIO_SEND_SAMPLES && now < next_send {
+                    thread::sleep(next_send - now);
+                    continue;
+                }
+
+                let count = available.min(AUDIO_SEND_SAMPLES);
+                for slot in samples.iter_mut().take(count) {
+                    *slot = pace_queue.pop().unwrap_or(0.0);
+                }
+
+                let packet_seq = pace_seq.fetch_add(1, Ordering::Relaxed);
+                let len =
+                    audio::audio_to_bytes(packet_seq, audio::CHANNELS, &samples[..count], &mut buf);
+                let _ = pace_sock.send_to(&buf[..len], target);
+                pace_pkts.fetch_add(1, Ordering::Relaxed);
+
+                next_send += send_interval;
+                let after_send = Instant::now();
+                if next_send <= after_send {
+                    next_send = after_send + send_interval;
+                }
+            }
+        });
+
         let mut last_log = Instant::now();
         while running.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
             if last_log.elapsed().as_secs() >= 5 {
                 let pkts = packets_sent.swap(0, Ordering::Relaxed);
-                eprintln!("audio: {pkts} pkts sent (5s)");
+                let queued = sample_queue.len();
+                let latency_ms =
+                    queued as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
+                let dropped = queue_drops.swap(0, Ordering::Relaxed);
+                eprintln!(
+                    "audio: {pkts} pkts sent (5s), queued {queued}/{AUDIO_SEND_QUEUE_CAPACITY} ({latency_ms:.1}ms), dropped {dropped}"
+                );
                 last_log = Instant::now();
             }
         }
         drop(stream);
+        if let Some(handle) = mmcss {
+            disable_mmcss_audio(handle);
+        }
         eprintln!("audio: stopped");
     });
 }
@@ -531,8 +655,9 @@ fn main() {
         loop {
             let (n, src) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
                     if sender_connected && last_heartbeat.elapsed().as_secs() > 5 {
                         release_all_keys(&mut held_keys);
@@ -707,7 +832,7 @@ fn main() {
                                     let args: Vec<String> = std::env::args().skip(1).collect();
                                     eprintln!("relaunching: {exe:?} {args:?}");
                                     match std::process::Command::new(&exe).args(&args).spawn() {
-                                        Ok(_) => {},
+                                        Ok(_) => {}
                                         Err(e) => eprintln!("relaunch failed: {e}"),
                                     }
                                     *control_flow = ControlFlow::Exit;
