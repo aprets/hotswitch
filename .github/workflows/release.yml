@@ -28,7 +28,21 @@ jobs:
         run: sed -i '' "1,5s/^version = \".*\"/version = \"${{ steps.v.outputs.version }}\"/" sender/Cargo.toml
       - run: cargo test -p hotswitch-proto
       - run: cargo build --release -p hotswitch-sender
-      - run: codesign -s - -f target/release/hotswitch-sender
+      - name: Sign macOS binary
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASS: ${{ secrets.MACOS_CERT_PASSWORD }}
+          CERT_PEM: ${{ secrets.MACOS_CERT_PEM }}
+        run: |
+          echo "$CERT_P12" | base64 -d > /tmp/cert.p12
+          echo "$CERT_PEM" > /tmp/cert.pem
+          security create-keychain -p "" build.keychain
+          security set-keychain-settings build.keychain
+          security list-keychains -d user -s build.keychain
+          security import /tmp/cert.p12 -k build.keychain -P "$CERT_PASS" -T /usr/bin/codesign
+          sudo security add-trusted-cert -d -r trustRoot -k build.keychain /tmp/cert.pem
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
+          codesign -s "Hotswitch" -f target/release/hotswitch-sender
       - run: tar -czf hotswitch-sender-aarch64-apple-darwin.tar.gz -C target/release hotswitch-sender
       - uses: actions/upload-artifact@v4
         with:

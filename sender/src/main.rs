@@ -762,11 +762,6 @@ fn main() {
                             Ok(status) => {
                                 eprintln!("update result: {status}");
                                 if status.updated() {
-                                    // Re-sign so macOS Accessibility permission survives the update
-                                    let _ = std::process::Command::new("codesign")
-                                        .args(["-s", "-", "-f"])
-                                        .arg(&exe)
-                                        .output();
                                     let args: Vec<String> = std::env::args().skip(1).collect();
                                     eprintln!("relaunching: {exe:?} {args:?}");
                                     match std::process::Command::new(&exe).args(&args).spawn() {
