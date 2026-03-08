@@ -299,31 +299,33 @@ fn start_audio_playback() {
         };
         eprintln!("audio: listening on port {}", audio::AUDIO_PORT);
 
-        let mut buf = [0u8; 1500];
-        let mut packets: u64 = 0;
-        let mut dropped: u64 = 0;
-        let mut last_log = Instant::now();
         let buf_capacity = audio::SAMPLE_RATE as usize;
+        let pkt_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let buf_fill = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        {
+            let pkt_count = pkt_count.clone();
+            let buf_fill = buf_fill.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(5));
+                let pkts = pkt_count.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let fill = buf_fill.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                let latency_ms = fill as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
+                eprintln!("audio: {pkts} pkts, buf {fill}/{buf_capacity} ({latency_ms:.1}ms)");
+            });
+        }
+
+        let mut buf = [0u8; 1500];
         loop {
             let n = match socket.recv(&mut buf) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
             if let Some((_channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
-                packets += 1;
+                pkt_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for sample in audio::raw_to_samples(raw) {
-                    if producer.push(sample).is_err() {
-                        dropped += 1;
-                    }
+                    let _ = producer.push(sample);
                 }
-            }
-            if last_log.elapsed().as_secs() >= 5 {
-                let buffered = buf_capacity - producer.slots();
-                let latency_ms = buffered as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
-                eprintln!("audio: {packets} pkts, buf {buffered}/{buf_capacity} ({latency_ms:.1}ms), {dropped} dropped");
-                packets = 0;
-                dropped = 0;
-                last_log = Instant::now();
+                buf_fill.store((buf_capacity - producer.slots()) as u32, std::sync::atomic::Ordering::Relaxed);
             }
         }
     });

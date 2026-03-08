@@ -296,66 +296,55 @@ fn open_log(path: &PathBuf) {
     let _ = std::process::Command::new(cmd).arg(path).spawn();
 }
 
-// --- Start on Login (Windows registry) ---
+// --- Start on Login (Task Scheduler, runs elevated) ---
+
+const TASK_NAME: &str = "Hotswitch";
 
 #[cfg(windows)]
 fn is_login_item() -> bool {
-    use windows::Win32::System::Registry::*;
-    use windows::core::HSTRING;
-    let key_path = HSTRING::from("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let mut hkey = HKEY::default();
-    let result = unsafe {
-        RegOpenKeyExW(HKEY_CURRENT_USER, &key_path, 0, KEY_READ, &mut hkey)
-    };
-    if result.is_err() {
-        return false;
-    }
-    let value_name = HSTRING::from("Hotswitch");
-    let exists = unsafe {
-        RegQueryValueExW(hkey, &value_name, None, None, None, None).is_ok()
-    };
-    unsafe { let _ = RegCloseKey(hkey); }
-    exists
+    std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
 fn set_login_item(enabled: bool) -> bool {
-    use windows::Win32::System::Registry::*;
-    use windows::core::HSTRING;
-    let key_path = HSTRING::from("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let mut hkey = HKEY::default();
-    let result = unsafe {
-        RegOpenKeyExW(HKEY_CURRENT_USER, &key_path, 0, KEY_WRITE, &mut hkey)
-    };
-    if result.is_err() {
-        eprintln!("Failed to open registry key");
-        return false;
-    }
-    let value_name = HSTRING::from("Hotswitch");
-    let ok = if enabled {
+    if enabled {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("Failed to get current exe path: {e}");
-                unsafe { let _ = RegCloseKey(hkey); }
+                eprintln!("failed to get current exe path: {e}");
                 return false;
             }
         };
-        let exe_str = exe.to_string_lossy();
-        let wide: Vec<u16> = exe_str.encode_utf16().chain(std::iter::once(0)).collect();
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
-        };
-        unsafe { RegSetValueExW(hkey, &value_name, 0, REG_SZ, Some(bytes)).is_ok() }
+        let exe_str = exe.to_string_lossy().to_string();
+        std::process::Command::new("schtasks")
+            .args([
+                "/Create", "/F",
+                "/TN", TASK_NAME,
+                "/TR", &exe_str,
+                "/SC", "ONLOGON",
+                "/RL", "HIGHEST",
+                "/IT",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     } else {
-        use windows::Win32::Foundation::{ERROR_SUCCESS, ERROR_FILE_NOT_FOUND};
-        match unsafe { RegDeleteValueW(hkey, &value_name) } {
-            ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => true,
-            e => { eprintln!("failed to remove registry value: {e:?}"); false }
-        }
-    };
-    unsafe { let _ = RegCloseKey(hkey); }
-    ok
+        std::process::Command::new("schtasks")
+            .args(["/Delete", "/F", "/TN", TASK_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(not(windows))]
