@@ -41,6 +41,7 @@ extern "C" {
 
 const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
 const HOTKEY_REQUIRES_CTRL: bool = true;
+const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
 const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
 const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 125; // ~8ms
 const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 25; // ~40ms
@@ -275,14 +276,30 @@ fn start_audio_playback() {
         let queue = Arc::new(ArrayQueue::<f32>::new(AUDIO_QUEUE_CAPACITY));
         let buf_fill = Arc::new(AtomicU32::new(0));
         let primed = Arc::new(AtomicBool::new(false));
+        let underruns = Arc::new(AtomicU32::new(0));
+        let trimmed = Arc::new(AtomicU32::new(0));
+        let stale_packets = Arc::new(AtomicU32::new(0));
 
-        let stream = device.build_output_stream(
-            &config,
-            {
-                let queue = queue.clone();
-                let buf_fill = buf_fill.clone();
-                let primed = primed.clone();
+        let make_stream = |config: &cpal::StreamConfig| {
+            let queue = queue.clone();
+            let buf_fill = buf_fill.clone();
+            let primed = primed.clone();
+            let underruns = underruns.clone();
+            let trimmed = trimmed.clone();
+            let mut last_callback_frames = 0u32;
+            device.build_output_stream(
+                config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
+                    if callback_frames != last_callback_frames {
+                        let callback_ms =
+                            callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
+                        eprintln!(
+                            "audio: output callback {callback_frames} frames ({callback_ms:.1}ms)"
+                        );
+                        last_callback_frames = callback_frames;
+                    }
+
                     let mut buffered = buf_fill.load(Ordering::Relaxed) as usize;
 
                     if buffered > AUDIO_RESET_FILL {
@@ -290,6 +307,7 @@ fn start_audio_playback() {
                         for _ in 0..to_drop {
                             if queue.pop().is_some() {
                                 buf_fill.fetch_sub(1, Ordering::Relaxed);
+                                trimmed.fetch_add(1, Ordering::Relaxed);
                             } else {
                                 break;
                             }
@@ -317,22 +335,44 @@ fn start_audio_playback() {
                     }
 
                     if underrun {
+                        underruns.fetch_add(1, Ordering::Relaxed);
                         primed.store(false, Ordering::Relaxed);
                         buf_fill.store(queue.len() as u32, Ordering::Relaxed);
                     }
+                },
+                |err| eprintln!("audio: playback error: {err}"),
+                None,
+            )
+        };
+
+        let mut chosen = "default".to_string();
+        let mut stream = None;
+        for frames in AUDIO_BUFFER_CANDIDATES {
+            let trial = cpal::StreamConfig {
+                channels: audio::CHANNELS,
+                sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Fixed(frames),
+            };
+            match make_stream(&trial) {
+                Ok(s) => {
+                    chosen = format!("{frames} frames");
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => eprintln!("audio: output buffer {frames} frames unsupported: {e}"),
+            }
+        }
+        let stream = match stream {
+            Some(s) => s,
+            None => match make_stream(&config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("audio: failed to build output stream: {e}");
+                    return;
                 }
             },
-            |err| eprintln!("audio: playback error: {err}"),
-            None,
-        );
-
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("audio: failed to build output stream: {e}");
-                return;
-            }
         };
+        eprintln!("audio: using output buffer {chosen}");
 
         if let Err(e) = stream.play() {
             eprintln!("audio: failed to start playback: {e}");
@@ -353,12 +393,20 @@ fn start_audio_playback() {
         {
             let pkt_count = pkt_count.clone();
             let buf_fill = buf_fill.clone();
+            let underruns = underruns.clone();
+            let trimmed = trimmed.clone();
+            let stale_packets = stale_packets.clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(5));
                 let pkts = pkt_count.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let fill = buf_fill.load(std::sync::atomic::Ordering::Relaxed) as usize;
                 let latency_ms = fill as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
-                eprintln!("audio: {pkts} pkts, buf {fill}/{buf_capacity} ({latency_ms:.1}ms)");
+                let underruns = underruns.swap(0, Ordering::Relaxed);
+                let trimmed = trimmed.swap(0, Ordering::Relaxed);
+                let stale = stale_packets.swap(0, Ordering::Relaxed);
+                eprintln!(
+                    "audio: {pkts} pkts, buf {fill}/{buf_capacity} ({latency_ms:.1}ms), underruns {underruns}, trimmed {trimmed}, stale {stale}"
+                );
             });
         }
 
@@ -372,6 +420,7 @@ fn start_audio_playback() {
             if let Some((seq, _channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
                 if let Some(prev) = last_seq {
                     if !seq_is_newer(seq, prev) {
+                        stale_packets.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 }
@@ -382,6 +431,7 @@ fn start_audio_playback() {
                         if queue.pop().is_some() {
                             buf_fill.fetch_sub(1, Ordering::Relaxed);
                             primed.store(false, Ordering::Relaxed);
+                            trimmed.fetch_add(1, Ordering::Relaxed);
                         } else {
                             break;
                         }

@@ -15,6 +15,8 @@ use tray_icon::{
     Icon, TrayIconBuilder,
 };
 
+const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
+
 #[cfg(windows)]
 mod inject {
     use std::ops::BitOrAssign;
@@ -389,31 +391,70 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         let pkt_count = packets_sent.clone();
         let next_seq = Arc::new(AtomicU32::new(0));
         let seq = next_seq.clone();
-        let stream = device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !run.load(Ordering::Relaxed) {
+        let make_stream = |config: &cpal::StreamConfig| {
+            let run = run.clone();
+            let sock = sock.clone();
+            let pkt_count = pkt_count.clone();
+            let seq = seq.clone();
+            let mut last_callback_frames = 0u32;
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
+                    if callback_frames != last_callback_frames {
+                        let callback_ms =
+                            callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
+                        eprintln!(
+                            "audio: input callback {callback_frames} frames ({callback_ms:.1}ms)"
+                        );
+                        last_callback_frames = callback_frames;
+                    }
+
+                    if !run.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut buf = [0u8; 1472];
+                    for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
+                        let packet_seq = seq.fetch_add(1, Ordering::Relaxed);
+                        let len =
+                            audio::audio_to_bytes(packet_seq, audio::CHANNELS, chunk, &mut buf);
+                        let _ = sock.send_to(&buf[..len], target);
+                        pkt_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                |err| eprintln!("audio: stream error: {err}"),
+                None,
+            )
+        };
+
+        let mut chosen = "default".to_string();
+        let mut stream = None;
+        for frames in AUDIO_BUFFER_CANDIDATES {
+            let trial = cpal::StreamConfig {
+                channels: audio::CHANNELS,
+                sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Fixed(frames),
+            };
+            match make_stream(&trial) {
+                Ok(s) => {
+                    chosen = format!("{frames} frames");
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => eprintln!("audio: input buffer {frames} frames unsupported: {e}"),
+            }
+        }
+        let stream = match stream {
+            Some(s) => s,
+            None => match make_stream(&config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("audio: failed to build input stream: {e}");
                     return;
                 }
-                let mut buf = [0u8; 1472];
-                for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
-                    let packet_seq = seq.fetch_add(1, Ordering::Relaxed);
-                    let len = audio::audio_to_bytes(packet_seq, audio::CHANNELS, chunk, &mut buf);
-                    let _ = sock.send_to(&buf[..len], target);
-                    pkt_count.fetch_add(1, Ordering::Relaxed);
-                }
             },
-            |err| eprintln!("audio: stream error: {err}"),
-            None,
-        );
-
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("audio: failed to build input stream: {e}");
-                return;
-            }
         };
+        eprintln!("audio: using input buffer {chosen}");
 
         if let Err(e) = stream.play() {
             eprintln!("audio: failed to start stream: {e}");
