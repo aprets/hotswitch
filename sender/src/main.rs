@@ -270,9 +270,9 @@ fn start_audio_playback() {
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let buffered = consumer.slots();
-                let drain_at = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 50; // ~20ms
+                let drain_at = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 10; // ~100ms
                 if buffered > drain_at {
-                    let target = drain_at / 2; // ~10ms
+                    let target = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 66; // ~15ms
                     for _ in 0..(buffered - target) {
                         let _ = consumer.pop();
                     }
