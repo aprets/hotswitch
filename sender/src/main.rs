@@ -44,6 +44,7 @@ const HOTKEY_REQUIRES_CTRL: bool = true;
 const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
 const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
 const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 125; // ~8ms
+const AUDIO_BIAS_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 83; // ~12ms
 const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 25; // ~40ms
 
 fn seq_is_newer(seq: u32, last: u32) -> bool {
@@ -287,6 +288,7 @@ fn start_audio_playback() {
             let underruns = underruns.clone();
             let trimmed = trimmed.clone();
             let mut last_callback_frames = 0u32;
+            let mut soft_trim_phase = 0u32;
             device.build_output_stream(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -321,6 +323,21 @@ fn start_audio_playback() {
                             return;
                         }
                         primed.store(true, Ordering::Relaxed);
+                    }
+
+                    // Nudge the queue downward very slowly when it drifts above the target.
+                    if buffered > AUDIO_BIAS_FILL {
+                        soft_trim_phase = soft_trim_phase.wrapping_add(1);
+                        if soft_trim_phase % 4 == 0 {
+                            for _ in 0..audio::CHANNELS as usize {
+                                if queue.pop().is_some() {
+                                    buf_fill.fetch_sub(1, Ordering::Relaxed);
+                                    trimmed.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                     }
 
                     let mut underrun = false;

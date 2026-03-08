@@ -640,7 +640,7 @@ fn main() {
         let mut sender_connected = false;
         let mut last_heartbeat = Instant::now();
         let mut sender_addr: Option<SocketAddr> = None;
-        let audio_running = Arc::new(AtomicBool::new(false));
+        let mut audio_running: Option<Arc<AtomicBool>> = None;
         let mut audio_target: Option<SocketAddr> = None;
 
         let release_all_keys = |keys: &mut HashSet<u16>| {
@@ -661,7 +661,9 @@ fn main() {
                 {
                     if sender_connected && last_heartbeat.elapsed().as_secs() > 5 {
                         release_all_keys(&mut held_keys);
-                        audio_running.store(false, Ordering::SeqCst);
+                        if let Some(run) = audio_running.take() {
+                            run.store(false, Ordering::SeqCst);
+                        }
                         audio_target = None;
                         eprintln!("WARNING: sender disconnected");
                         sender_connected = false;
@@ -679,7 +681,9 @@ fn main() {
             if !sender_connected || sender_addr != Some(src) {
                 if sender_connected {
                     release_all_keys(&mut held_keys);
-                    audio_running.store(false, Ordering::SeqCst);
+                    if let Some(run) = audio_running.take() {
+                        run.store(false, Ordering::SeqCst);
+                    }
                     audio_target = None;
                 }
                 println!("sender connected from {src}");
@@ -691,10 +695,10 @@ fn main() {
 
                 let target = SocketAddr::new(src.ip(), audio::AUDIO_PORT);
                 if audio_target != Some(target) {
-                    audio_running.store(false, Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(50));
-                    audio_running.store(true, Ordering::SeqCst);
-                    start_audio_capture(target, audio_running.clone());
+                    let run = Arc::new(AtomicBool::new(true));
+                    start_audio_capture(target, run.clone());
+                    audio_running = Some(run);
                     audio_target = Some(target);
                 }
             }
