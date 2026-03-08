@@ -269,6 +269,14 @@ fn start_audio_playback() {
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let buffered = consumer.slots();
+                let drain_at = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 50; // ~20ms
+                if buffered > drain_at {
+                    let target = drain_at / 2; // ~10ms
+                    for _ in 0..(buffered - target) {
+                        let _ = consumer.pop();
+                    }
+                }
                 for sample in data.iter_mut() {
                     *sample = consumer.pop().unwrap_or(0.0);
                 }
