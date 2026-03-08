@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hotswitch_proto::{audio, keymap, Event};
 use std::collections::HashSet;
