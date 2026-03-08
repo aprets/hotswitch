@@ -42,10 +42,10 @@ extern "C" {
 const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
 const HOTKEY_REQUIRES_CTRL: bool = true;
 const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
-const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 16; // ~62ms
-const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 83; // ~12ms
-const AUDIO_BIAS_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 50; // ~20ms
-const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 25; // ~40ms
+const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 12; // ~83ms
+const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 66; // ~15ms
+const AUDIO_BIAS_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 40; // ~25ms
+const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
 
 fn seq_is_newer(seq: u32, last: u32) -> bool {
     (seq.wrapping_sub(last) as i32) > 0
