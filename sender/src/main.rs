@@ -6,6 +6,7 @@ use core_graphics::{
         CGEventTapPlacement, CGEventTapProxy, CGEventType, EventField,
     },
 };
+use crossbeam_queue::ArrayQueue;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hotswitch_proto::{audio, Event};
 use std::{
@@ -14,7 +15,7 @@ use std::{
     net::UdpSocket,
     path::PathBuf,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -40,6 +41,13 @@ extern "C" {
 
 const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
 const HOTKEY_REQUIRES_CTRL: bool = true;
+const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
+const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 125; // ~8ms
+const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 25; // ~40ms
+
+fn seq_is_newer(seq: u32, last: u32) -> bool {
+    (seq.wrapping_sub(last) as i32) > 0
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -264,21 +272,54 @@ fn start_audio_playback() {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(audio::SAMPLE_RATE as usize);
+        let queue = Arc::new(ArrayQueue::<f32>::new(AUDIO_QUEUE_CAPACITY));
+        let buf_fill = Arc::new(AtomicU32::new(0));
+        let primed = Arc::new(AtomicBool::new(false));
 
         let stream = device.build_output_stream(
             &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let buffered = consumer.slots();
-                let drain_at = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 10; // ~100ms
-                if buffered > drain_at {
-                    let target = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 66; // ~15ms
-                    for _ in 0..(buffered - target) {
-                        let _ = consumer.pop();
+            {
+                let queue = queue.clone();
+                let buf_fill = buf_fill.clone();
+                let primed = primed.clone();
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let mut buffered = buf_fill.load(Ordering::Relaxed) as usize;
+
+                    if buffered > AUDIO_RESET_FILL {
+                        let to_drop = buffered.saturating_sub(AUDIO_TARGET_FILL);
+                        for _ in 0..to_drop {
+                            if queue.pop().is_some() {
+                                buf_fill.fetch_sub(1, Ordering::Relaxed);
+                            } else {
+                                break;
+                            }
+                        }
+                        buffered = buf_fill.load(Ordering::Relaxed) as usize;
                     }
-                }
-                for sample in data.iter_mut() {
-                    *sample = consumer.pop().unwrap_or(0.0);
+
+                    if !primed.load(Ordering::Relaxed) {
+                        if buffered < AUDIO_TARGET_FILL {
+                            data.fill(0.0);
+                            return;
+                        }
+                        primed.store(true, Ordering::Relaxed);
+                    }
+
+                    let mut underrun = false;
+                    for sample in data.iter_mut() {
+                        if let Some(v) = queue.pop() {
+                            *sample = v;
+                            buf_fill.fetch_sub(1, Ordering::Relaxed);
+                        } else {
+                            *sample = 0.0;
+                            underrun = true;
+                        }
+                    }
+
+                    if underrun {
+                        primed.store(false, Ordering::Relaxed);
+                        buf_fill.store(queue.len() as u32, Ordering::Relaxed);
+                    }
                 }
             },
             |err| eprintln!("audio: playback error: {err}"),
@@ -307,9 +348,8 @@ fn start_audio_playback() {
         };
         eprintln!("audio: listening on port {}", audio::AUDIO_PORT);
 
-        let buf_capacity = audio::SAMPLE_RATE as usize;
+        let buf_capacity = AUDIO_QUEUE_CAPACITY;
         let pkt_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let buf_fill = Arc::new(std::sync::atomic::AtomicU32::new(0));
         {
             let pkt_count = pkt_count.clone();
             let buf_fill = buf_fill.clone();
@@ -323,17 +363,33 @@ fn start_audio_playback() {
         }
 
         let mut buf = [0u8; 1500];
+        let mut last_seq = None;
         loop {
             let n = match socket.recv(&mut buf) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            if let Some((_channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
+            if let Some((seq, _channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
+                if let Some(prev) = last_seq {
+                    if !seq_is_newer(seq, prev) {
+                        continue;
+                    }
+                }
+                last_seq = Some(seq);
                 pkt_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for sample in audio::raw_to_samples(raw) {
-                    let _ = producer.push(sample);
+                    while queue.len() >= AUDIO_QUEUE_CAPACITY {
+                        if queue.pop().is_some() {
+                            buf_fill.fetch_sub(1, Ordering::Relaxed);
+                            primed.store(false, Ordering::Relaxed);
+                        } else {
+                            break;
+                        }
+                    }
+                    if queue.push(sample).is_ok() {
+                        buf_fill.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                buf_fill.store((buf_capacity - producer.slots()) as u32, std::sync::atomic::Ordering::Relaxed);
             }
         }
     });

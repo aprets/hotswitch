@@ -5,7 +5,7 @@ use hotswitch_proto::{audio, keymap, Event};
 use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -387,6 +387,8 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         let run = running.clone();
         let packets_sent = Arc::new(AtomicU64::new(0));
         let pkt_count = packets_sent.clone();
+        let next_seq = Arc::new(AtomicU32::new(0));
+        let seq = next_seq.clone();
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -395,7 +397,8 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
                 }
                 let mut buf = [0u8; 1472];
                 for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
-                    let len = audio::audio_to_bytes(audio::CHANNELS, chunk, &mut buf);
+                    let packet_seq = seq.fetch_add(1, Ordering::Relaxed);
+                    let len = audio::audio_to_bytes(packet_seq, audio::CHANNELS, chunk, &mut buf);
                     let _ = sock.send_to(&buf[..len], target);
                     pkt_count.fetch_add(1, Ordering::Relaxed);
                 }
