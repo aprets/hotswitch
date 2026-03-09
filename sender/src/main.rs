@@ -2,18 +2,20 @@ use core_foundation::{base::TCFType, boolean::CFBoolean, runloop::CFRunLoop, str
 use core_graphics::{
     display::CGDisplay,
     event::{
-        CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-        CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
+        CallbackResult, CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
+        CGEventTapPlacement, CGEventTapProxy, CGEventType, EventField,
     },
 };
-use hotswitch_proto::Event;
+use crossbeam_queue::ArrayQueue;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use hotswitch_proto::{audio, Event};
 use std::{
     collections::HashSet,
     ffi::c_void,
     net::UdpSocket,
     path::PathBuf,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -39,6 +41,15 @@ extern "C" {
 
 const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
 const HOTKEY_REQUIRES_CTRL: bool = true;
+const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
+const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 12; // ~83ms
+const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 66; // ~15ms
+const AUDIO_BIAS_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 40; // ~25ms
+const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
+
+fn seq_is_newer(seq: u32, last: u32) -> bool {
+    (seq.wrapping_sub(last) as i32) > 0
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -101,8 +112,11 @@ fn check_for_update() -> Option<String> {
         .fetch()
         .ok()?;
     let latest = releases.first()?;
-    if self_update::version::bump_is_greater(self_update::cargo_crate_version!(), &latest.version)
-        .unwrap_or(false)
+    if self_update::version::bump_is_greater(
+        self_update::cargo_crate_version!(),
+        &latest.version,
+    )
+    .unwrap_or(false)
     {
         Some(latest.version.clone())
     } else {
@@ -229,25 +243,222 @@ fn set_login_item(enabled: bool, target_addr: &str) -> bool {
             let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::write(&path, plist) {
-            Ok(()) => {
-                eprintln!("wrote launch agent: {}", path.display());
-                true
-            }
-            Err(e) => {
-                eprintln!("failed to write launch agent: {e}");
-                false
-            }
+            Ok(()) => { eprintln!("wrote launch agent: {}", path.display()); true }
+            Err(e) => { eprintln!("failed to write launch agent: {e}"); false }
         }
     } else {
         match std::fs::remove_file(&path) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                eprintln!("failed to remove launch agent: {e}");
-                false
-            }
+            Err(e) => { eprintln!("failed to remove launch agent: {e}"); false }
         }
     }
+}
+
+fn start_audio_playback() {
+    thread::spawn(move || {
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("audio: no output device");
+                return;
+            }
+        };
+        let device_name = device.name().unwrap_or_default();
+        eprintln!("audio: playing on {device_name}");
+
+        let config = cpal::StreamConfig {
+            channels: audio::CHANNELS,
+            sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let queue = Arc::new(ArrayQueue::<f32>::new(AUDIO_QUEUE_CAPACITY));
+        let buf_fill = Arc::new(AtomicU32::new(0));
+        let primed = Arc::new(AtomicBool::new(false));
+        let underruns = Arc::new(AtomicU32::new(0));
+        let trimmed = Arc::new(AtomicU32::new(0));
+        let stale_packets = Arc::new(AtomicU32::new(0));
+
+        let make_stream = |config: &cpal::StreamConfig| {
+            let queue = queue.clone();
+            let buf_fill = buf_fill.clone();
+            let primed = primed.clone();
+            let underruns = underruns.clone();
+            let trimmed = trimmed.clone();
+            let mut last_callback_frames = 0u32;
+            let mut soft_trim_phase = 0u32;
+            device.build_output_stream(
+                config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
+                    if callback_frames != last_callback_frames {
+                        let callback_ms =
+                            callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
+                        eprintln!(
+                            "audio: output callback {callback_frames} frames ({callback_ms:.1}ms)"
+                        );
+                        last_callback_frames = callback_frames;
+                    }
+
+                    let mut buffered = buf_fill.load(Ordering::Relaxed) as usize;
+
+                    if buffered > AUDIO_RESET_FILL {
+                        let to_drop = buffered.saturating_sub(AUDIO_TARGET_FILL);
+                        for _ in 0..to_drop {
+                            if queue.pop().is_some() {
+                                buf_fill.fetch_sub(1, Ordering::Relaxed);
+                                trimmed.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                break;
+                            }
+                        }
+                        buffered = buf_fill.load(Ordering::Relaxed) as usize;
+                    }
+
+                    if !primed.load(Ordering::Relaxed) {
+                        if buffered < AUDIO_TARGET_FILL {
+                            data.fill(0.0);
+                            return;
+                        }
+                        primed.store(true, Ordering::Relaxed);
+                    }
+
+                    if buffered > AUDIO_BIAS_FILL {
+                        soft_trim_phase = soft_trim_phase.wrapping_add(1);
+                        if soft_trim_phase % 8 == 0 {
+                            for _ in 0..audio::CHANNELS as usize {
+                                if queue.pop().is_some() {
+                                    buf_fill.fetch_sub(1, Ordering::Relaxed);
+                                    trimmed.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    let mut underrun = false;
+                    for sample in data.iter_mut() {
+                        if let Some(v) = queue.pop() {
+                            *sample = v;
+                            buf_fill.fetch_sub(1, Ordering::Relaxed);
+                        } else {
+                            *sample = 0.0;
+                            underrun = true;
+                        }
+                    }
+
+                    if underrun {
+                        underruns.fetch_add(1, Ordering::Relaxed);
+                        primed.store(false, Ordering::Relaxed);
+                        buf_fill.store(queue.len() as u32, Ordering::Relaxed);
+                    }
+                },
+                |err| eprintln!("audio: playback error: {err}"),
+                None,
+            )
+        };
+
+        let mut chosen = "default".to_string();
+        let mut stream = None;
+        for frames in AUDIO_BUFFER_CANDIDATES {
+            let trial = cpal::StreamConfig {
+                channels: audio::CHANNELS,
+                sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Fixed(frames),
+            };
+            match make_stream(&trial) {
+                Ok(s) => {
+                    chosen = format!("{frames} frames");
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => eprintln!("audio: output buffer {frames} frames unsupported: {e}"),
+            }
+        }
+        let stream = match stream {
+            Some(s) => s,
+            None => match make_stream(&config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("audio: failed to build output stream: {e}");
+                    return;
+                }
+            },
+        };
+        eprintln!("audio: using output buffer {chosen}");
+
+        if let Err(e) = stream.play() {
+            eprintln!("audio: failed to start playback: {e}");
+            return;
+        }
+
+        let socket = match UdpSocket::bind(format!("0.0.0.0:{}", audio::AUDIO_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("audio: failed to bind on port {}: {e}", audio::AUDIO_PORT);
+                return;
+            }
+        };
+        eprintln!("audio: listening on port {}", audio::AUDIO_PORT);
+
+        let buf_capacity = AUDIO_QUEUE_CAPACITY;
+        let pkt_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let pkt_count = pkt_count.clone();
+            let buf_fill = buf_fill.clone();
+            let underruns = underruns.clone();
+            let trimmed = trimmed.clone();
+            let stale_packets = stale_packets.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(5));
+                let pkts = pkt_count.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let fill = buf_fill.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                let latency_ms = fill as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
+                let underruns = underruns.swap(0, Ordering::Relaxed);
+                let trimmed = trimmed.swap(0, Ordering::Relaxed);
+                let stale = stale_packets.swap(0, Ordering::Relaxed);
+                eprintln!(
+                    "audio: {pkts} pkts, buf {fill}/{buf_capacity} ({latency_ms:.1}ms), underruns {underruns}, trimmed {trimmed}, stale {stale}"
+                );
+            });
+        }
+
+        let mut buf = [0u8; 1500];
+        let mut last_seq = None;
+        loop {
+            let n = match socket.recv(&mut buf) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if let Some((seq, _channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
+                if let Some(prev) = last_seq {
+                    if !seq_is_newer(seq, prev) {
+                        stale_packets.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                last_seq = Some(seq);
+                pkt_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for sample in audio::raw_to_samples(raw) {
+                    while queue.len() >= AUDIO_QUEUE_CAPACITY {
+                        if queue.pop().is_some() {
+                            buf_fill.fetch_sub(1, Ordering::Relaxed);
+                            primed.store(false, Ordering::Relaxed);
+                            trimmed.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            break;
+                        }
+                    }
+                    if queue.push(sample).is_ok() {
+                        buf_fill.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn main() {
@@ -264,6 +475,8 @@ fn main() {
         .connect(&target_addr)
         .expect("Failed to connect UDP socket");
     socket.set_nonblocking(true).ok();
+
+    start_audio_playback();
 
     unsafe {
         let conn = _CGSDefaultConnection();
@@ -335,176 +548,154 @@ fn main() {
         CGEventType::FlagsChanged,
     ];
 
-    let event_tap_callback = move |_proxy: CGEventTapProxy,
-                                   event_type: CGEventType,
-                                   cg_ev: &CGEvent|
-          -> CallbackResult {
-        if matches!(
-            event_type,
-            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-        ) {
-            eprintln!("WARNING: CGEventTap was disabled, re-enabling");
-            let port = tp.load(Ordering::SeqCst);
-            if !port.is_null() {
-                unsafe {
-                    CGEventTapEnable(port, true);
+    let event_tap_callback =
+        move |_proxy: CGEventTapProxy, event_type: CGEventType, cg_ev: &CGEvent| -> CallbackResult {
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                eprintln!("WARNING: CGEventTap was disabled, re-enabling");
+                let port = tp.load(Ordering::SeqCst);
+                if !port.is_null() {
+                    unsafe { CGEventTapEnable(port, true); }
                 }
+                return CallbackResult::Keep;
             }
-            return CallbackResult::Keep;
-        }
 
-        if matches!(event_type, CGEventType::KeyDown) {
-            let keycode = cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-            if keycode == HOTKEY_KEYCODE {
-                let flags = cg_ev.get_flags();
-                let ctrl_held = flags.contains(CGEventFlags::CGEventFlagControl);
-                if ctrl_held || !HOTKEY_REQUIRES_CTRL {
-                    let was_capturing = cap.load(Ordering::SeqCst);
-                    if !was_capturing && !rc_tap.load(Ordering::SeqCst) {
-                        let _ = proxy_tap.send_event(UserEvent::CaptureBlocked);
+            if matches!(event_type, CGEventType::KeyDown) {
+                let keycode = cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                if keycode == HOTKEY_KEYCODE {
+                    let flags = cg_ev.get_flags();
+                    let ctrl_held = flags.contains(CGEventFlags::CGEventFlagControl);
+                    if ctrl_held || !HOTKEY_REQUIRES_CTRL {
+                        let was_capturing = cap.load(Ordering::SeqCst);
+                        if !was_capturing && !rc_tap.load(Ordering::SeqCst) {
+                            let _ = proxy_tap.send_event(UserEvent::CaptureBlocked);
+                            return CallbackResult::Drop;
+                        }
+                        let now_capturing = !was_capturing;
+                        cap.store(now_capturing, Ordering::SeqCst);
+                        eprintln!("capture {}", if now_capturing { "started" } else { "stopped" });
+
+                        if now_capturing {
+                            unsafe { CGAssociateMouseAndMouseCursorPosition(false); }
+                            let _ = CGDisplay::hide_cursor(&CGDisplay::main());
+                            *adx.lock().unwrap() = 0.0;
+                            *ady.lock().unwrap() = 0.0;
+                        } else {
+                            unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
+                            let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                            let held: Vec<u16> = keys.lock().unwrap().drain().collect();
+                            let mut buf = [0u8; 64];
+                            for keycode in held {
+                                let evt = Event::Key { keycode, pressed: false };
+                                let len = evt.to_bytes(&mut buf);
+                                let _ = sock.send(&buf[..len]);
+                            }
+                        }
+                        compute_tap();
+                        let _ = proxy_tap.send_event(UserEvent::StateChanged);
                         return CallbackResult::Drop;
                     }
-                    let now_capturing = !was_capturing;
-                    cap.store(now_capturing, Ordering::SeqCst);
-                    eprintln!(
-                        "capture {}",
-                        if now_capturing { "started" } else { "stopped" }
-                    );
+                }
+            }
 
-                    if now_capturing {
-                        unsafe {
-                            CGAssociateMouseAndMouseCursorPosition(false);
-                        }
-                        let _ = CGDisplay::hide_cursor(&CGDisplay::main());
-                        *adx.lock().unwrap() = 0.0;
-                        *ady.lock().unwrap() = 0.0;
-                    } else {
-                        unsafe {
-                            CGAssociateMouseAndMouseCursorPosition(true);
-                        }
-                        let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                        let held: Vec<u16> = keys.lock().unwrap().drain().collect();
-                        let mut buf = [0u8; 64];
-                        for keycode in held {
-                            let evt = Event::Key {
-                                keycode,
-                                pressed: false,
-                            };
-                            let len = evt.to_bytes(&mut buf);
-                            let _ = sock.send(&buf[..len]);
-                        }
+            if !cap.load(Ordering::SeqCst) {
+                return CallbackResult::Keep;
+            }
+
+            let mut buf = [0u8; 64];
+
+            match event_type {
+                CGEventType::MouseMoved
+                | CGEventType::LeftMouseDragged
+                | CGEventType::RightMouseDragged
+                | CGEventType::OtherMouseDragged => {
+                    let raw_dx = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                    let raw_dy = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                    let mut ax = adx.lock().unwrap();
+                    let mut ay = ady.lock().unwrap();
+                    *ax += raw_dx;
+                    *ay += raw_dy;
+                    let dx = (*ax).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    let dy = (*ay).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    *ax -= dx as f64;
+                    *ay -= dy as f64;
+                    if dx != 0 || dy != 0 {
+                        let evt = Event::MouseMove { dx, dy };
+                        let len = evt.to_bytes(&mut buf);
+                        let _ = sock.send(&buf[..len]);
                     }
-                    compute_tap();
-                    let _ = proxy_tap.send_event(UserEvent::StateChanged);
-                    return CallbackResult::Drop;
                 }
-            }
-        }
 
-        if !cap.load(Ordering::SeqCst) {
-            return CallbackResult::Keep;
-        }
+                CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+                | CGEventType::RightMouseDown
+                | CGEventType::RightMouseUp
+                | CGEventType::OtherMouseDown
+                | CGEventType::OtherMouseUp => {
+                    if let Some((button, pressed)) = map_mouse_button(&event_type, cg_ev) {
+                        let evt = Event::MouseButton { button, pressed };
+                        let len = evt.to_bytes(&mut buf);
+                        let _ = sock.send(&buf[..len]);
+                    }
+                }
 
-        let mut buf = [0u8; 64];
+                CGEventType::ScrollWheel => {
+                    let v = cg_ev
+                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
+                        as i16;
+                    let h = cg_ev
+                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
+                        as i16;
+                    if v != 0 || h != 0 {
+                        let evt = Event::Scroll { dx: h, dy: v };
+                        let len = evt.to_bytes(&mut buf);
+                        let _ = sock.send(&buf[..len]);
+                    }
+                }
 
-        match event_type {
-            CGEventType::MouseMoved
-            | CGEventType::LeftMouseDragged
-            | CGEventType::RightMouseDragged
-            | CGEventType::OtherMouseDragged => {
-                let raw_dx = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
-                let raw_dy = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-                let mut ax = adx.lock().unwrap();
-                let mut ay = ady.lock().unwrap();
-                *ax += raw_dx;
-                *ay += raw_dy;
-                let dx = (*ax).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                let dy = (*ay).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                *ax -= dx as f64;
-                *ay -= dy as f64;
-                if dx != 0 || dy != 0 {
-                    let evt = Event::MouseMove { dx, dy };
+                CGEventType::KeyDown => {
+                    let keycode =
+                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                    keys.lock().unwrap().insert(keycode);
+                    let evt = Event::Key { keycode, pressed: true };
                     let len = evt.to_bytes(&mut buf);
                     let _ = sock.send(&buf[..len]);
                 }
-            }
-
-            CGEventType::LeftMouseDown
-            | CGEventType::LeftMouseUp
-            | CGEventType::RightMouseDown
-            | CGEventType::RightMouseUp
-            | CGEventType::OtherMouseDown
-            | CGEventType::OtherMouseUp => {
-                if let Some((button, pressed)) = map_mouse_button(&event_type, cg_ev) {
-                    let evt = Event::MouseButton { button, pressed };
+                CGEventType::KeyUp => {
+                    let keycode =
+                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                    keys.lock().unwrap().remove(&keycode);
+                    let evt = Event::Key { keycode, pressed: false };
                     let len = evt.to_bytes(&mut buf);
                     let _ = sock.send(&buf[..len]);
                 }
-            }
-
-            CGEventType::ScrollWheel => {
-                let v = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
-                    as i16;
-                let h = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
-                    as i16;
-                if v != 0 || h != 0 {
-                    let evt = Event::Scroll { dx: h, dy: v };
+                CGEventType::FlagsChanged => {
+                    let keycode =
+                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                    let flags = cg_ev.get_flags();
+                    let mut k = keys.lock().unwrap();
+                    let pressed = match keycode {
+                        0x38 | 0x3C => flags.contains(CGEventFlags::CGEventFlagShift),
+                        0x3B | 0x3E => flags.contains(CGEventFlags::CGEventFlagControl),
+                        0x3A | 0x3D => flags.contains(CGEventFlags::CGEventFlagAlternate),
+                        0x37 | 0x36 => flags.contains(CGEventFlags::CGEventFlagCommand),
+                        0x39 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
+                        _ => !k.contains(&keycode),
+                    };
+                    if pressed { k.insert(keycode); } else { k.remove(&keycode); }
+                    drop(k);
+                    let evt = Event::Key { keycode, pressed };
                     let len = evt.to_bytes(&mut buf);
                     let _ = sock.send(&buf[..len]);
                 }
+
+                _ => {}
             }
 
-            CGEventType::KeyDown => {
-                let keycode =
-                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                keys.lock().unwrap().insert(keycode);
-                let evt = Event::Key {
-                    keycode,
-                    pressed: true,
-                };
-                let len = evt.to_bytes(&mut buf);
-                let _ = sock.send(&buf[..len]);
-            }
-            CGEventType::KeyUp => {
-                let keycode =
-                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                keys.lock().unwrap().remove(&keycode);
-                let evt = Event::Key {
-                    keycode,
-                    pressed: false,
-                };
-                let len = evt.to_bytes(&mut buf);
-                let _ = sock.send(&buf[..len]);
-            }
-            CGEventType::FlagsChanged => {
-                let keycode =
-                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                let flags = cg_ev.get_flags();
-                let mut k = keys.lock().unwrap();
-                let pressed = match keycode {
-                    0x38 | 0x3C => flags.contains(CGEventFlags::CGEventFlagShift),
-                    0x3B | 0x3E => flags.contains(CGEventFlags::CGEventFlagControl),
-                    0x3A | 0x3D => flags.contains(CGEventFlags::CGEventFlagAlternate),
-                    0x37 | 0x36 => flags.contains(CGEventFlags::CGEventFlagCommand),
-                    0x39 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
-                    _ => !k.contains(&keycode),
-                };
-                if pressed {
-                    k.insert(keycode);
-                } else {
-                    k.remove(&keycode);
-                }
-                drop(k);
-                let evt = Event::Key { keycode, pressed };
-                let len = evt.to_bytes(&mut buf);
-                let _ = sock.send(&buf[..len]);
-            }
-
-            _ => {}
-        }
-
-        CallbackResult::Drop
-    };
+            CallbackResult::Drop
+        };
 
     let tap = CGEventTap::new(
         CGEventTapLocation::Session,
@@ -515,10 +706,7 @@ fn main() {
     )
     .expect("Failed to create CGEventTap — is Accessibility permission granted?");
 
-    tap_port.store(
-        tap.mach_port().as_CFTypeRef() as *mut c_void,
-        Ordering::SeqCst,
-    );
+    tap_port.store(tap.mach_port().as_CFTypeRef() as *mut c_void, Ordering::SeqCst);
 
     let source = tap
         .mach_port()
@@ -526,8 +714,7 @@ fn main() {
         .expect("Failed to create runloop source");
 
     unsafe {
-        CFRunLoop::get_current()
-            .add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
+        CFRunLoop::get_current().add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
     }
 
     // --- Heartbeat listener thread ---
@@ -652,9 +839,7 @@ fn main() {
             _ => ControlFlow::Wait,
         };
 
-        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) =
-            &event
-        {
+        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) = &event {
             let now = Instant::now();
             if flash_until.map_or(false, |d| now >= d) {
                 flash_until = None;
@@ -686,8 +871,7 @@ fn main() {
                     update_item.set_text(format!("Update to v{ver}"));
                 }
                 UserEvent::CaptureBlocked => {
-                    let _ =
-                        tray.set_icon_with_as_template(Some(make_icon(220, 38, 38, true)), false);
+                    let _ = tray.set_icon_with_as_template(Some(make_icon(220, 38, 38, true)), false);
                     let _ = tray.set_tooltip(Some("Hotswitch — No receiver"));
                     let deadline = Instant::now() + Duration::from_secs(2);
                     flash_until = Some(deadline);
@@ -696,9 +880,7 @@ fn main() {
                 UserEvent::Menu(me) => {
                     if me.id == quit_id {
                         if capturing.load(Ordering::SeqCst) {
-                            unsafe {
-                                CGAssociateMouseAndMouseCursorPosition(true);
-                            }
+                            unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
                             let _ = CGDisplay::show_cursor(&CGDisplay::main());
                         }
                         *control_flow = ControlFlow::Exit;
@@ -713,7 +895,7 @@ fn main() {
                                     let args: Vec<String> = std::env::args().skip(1).collect();
                                     eprintln!("relaunching: {exe:?} {args:?}");
                                     match std::process::Command::new(&exe).args(&args).spawn() {
-                                        Ok(_) => {}
+                                        Ok(_) => {},
                                         Err(e) => eprintln!("relaunch failed: {e}"),
                                     }
                                     *control_flow = ControlFlow::Exit;
@@ -735,10 +917,7 @@ fn main() {
                         }
                         update_item.set_enabled(true);
                     } else if me.id == log_id {
-                        let _ = std::process::Command::new("open")
-                            .arg("-t")
-                            .arg(&log_file_path)
-                            .spawn();
+                        let _ = std::process::Command::new("open").arg("-t").arg(&log_file_path).spawn();
                     } else if me.id == login_id {
                         if set_login_item(!login_checked, &addr_for_login) {
                             login_checked = !login_checked;

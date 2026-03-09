@@ -1,10 +1,12 @@
 #![windows_subsystem = "windows"]
 
-use hotswitch_proto::{keymap, Event};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam_queue::ArrayQueue;
+use hotswitch_proto::{audio, keymap, Event};
 use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +15,61 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
 };
+#[cfg(windows)]
+use windows::{
+    core::w,
+    Win32::{
+        Foundation::HANDLE,
+        System::Threading::{
+            AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+            AVRT_PRIORITY_HIGH,
+        },
+    },
+};
+
+const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
+const AUDIO_SEND_FRAMES: u32 = 96;
+const AUDIO_SEND_SAMPLES: usize = AUDIO_SEND_FRAMES as usize * audio::CHANNELS as usize;
+const AUDIO_SEND_QUEUE_CAPACITY: usize =
+    (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
+
+#[cfg(windows)]
+type MmcssHandle = HANDLE;
+#[cfg(not(windows))]
+type MmcssHandle = ();
+
+#[cfg(windows)]
+fn enable_mmcss_audio() -> Option<MmcssHandle> {
+    let mut task_index = 0;
+    let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) };
+    match handle {
+        Ok(handle) => {
+            let _ = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH) };
+            eprintln!("audio: MMCSS enabled");
+            Some(handle)
+        }
+        Err(e) => {
+            eprintln!("audio: failed to enable MMCSS: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn disable_mmcss_audio(handle: MmcssHandle) {
+    if let Err(e) = unsafe { AvRevertMmThreadCharacteristics(handle) } {
+        eprintln!("audio: failed to disable MMCSS: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_mmcss_audio() -> Option<MmcssHandle> {
+    None
+}
+
+#[cfg(not(windows))]
+fn disable_mmcss_audio(_handle: MmcssHandle) {}
+
 #[cfg(windows)]
 mod inject {
     use std::ops::BitOrAssign;
@@ -185,19 +242,11 @@ enum UserEvent {
 }
 
 fn icon_size() -> u32 {
-    #[cfg(windows)]
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
-    #[cfg(windows)]
-    {
-        let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
-        if size > 0 {
-            (size as u32) * 2
-        } else {
-            32
-        }
-    }
-    #[cfg(not(windows))]
-    {
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    if size > 0 {
+        (size as u32) * 2
+    } else {
         32
     }
 }
@@ -307,7 +356,6 @@ fn open_log(path: &PathBuf) {
 
 // --- Start on Login (Task Scheduler, runs elevated) ---
 
-#[cfg(windows)]
 const TASK_NAME: &str = "Hotswitch";
 
 #[cfg(windows)]
@@ -362,6 +410,196 @@ fn set_login_item(_enabled: bool) -> bool {
     true
 }
 
+fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let mmcss = enable_mmcss_audio();
+        let host = cpal::default_host();
+
+        // WASAPI loopback: use the default *output* device as an input source
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("audio: no output device for loopback capture");
+                if let Some(handle) = mmcss {
+                    disable_mmcss_audio(handle);
+                }
+                return;
+            }
+        };
+        let device_name = device.name().unwrap_or_default();
+        eprintln!("audio: capturing from {device_name}");
+
+        let config = cpal::StreamConfig {
+            channels: audio::CHANNELS,
+            sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                eprintln!("audio: failed to bind socket: {e}");
+                if let Some(handle) = mmcss {
+                    disable_mmcss_audio(handle);
+                }
+                return;
+            }
+        };
+
+        let sock = socket.clone();
+        let run = running.clone();
+        let packets_sent = Arc::new(AtomicU64::new(0));
+        let pkt_count = packets_sent.clone();
+        let queue_drops = Arc::new(AtomicU64::new(0));
+        let drop_count = queue_drops.clone();
+        let next_seq = Arc::new(AtomicU32::new(0));
+        let seq = next_seq.clone();
+        let sample_queue = Arc::new(ArrayQueue::<f32>::new(AUDIO_SEND_QUEUE_CAPACITY));
+        let queue = sample_queue.clone();
+        let make_stream = |config: &cpal::StreamConfig| {
+            let run = run.clone();
+            let queue = queue.clone();
+            let drop_count = drop_count.clone();
+            let mut last_callback_frames = 0u32;
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
+                    if callback_frames != last_callback_frames {
+                        let callback_ms =
+                            callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
+                        eprintln!(
+                            "audio: input callback {callback_frames} frames ({callback_ms:.1}ms)"
+                        );
+                        last_callback_frames = callback_frames;
+                    }
+
+                    if !run.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    for &sample in data {
+                        while queue.len() >= AUDIO_SEND_QUEUE_CAPACITY {
+                            if queue.pop().is_some() {
+                                drop_count.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                break;
+                            }
+                        }
+                        let _ = queue.push(sample);
+                    }
+                },
+                |err| eprintln!("audio: stream error: {err}"),
+                None,
+            )
+        };
+
+        let mut chosen = "default".to_string();
+        let mut stream = None;
+        for frames in AUDIO_BUFFER_CANDIDATES {
+            let trial = cpal::StreamConfig {
+                channels: audio::CHANNELS,
+                sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Fixed(frames),
+            };
+            match make_stream(&trial) {
+                Ok(s) => {
+                    chosen = format!("{frames} frames");
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => eprintln!("audio: input buffer {frames} frames unsupported: {e}"),
+            }
+        }
+        let stream = match stream {
+            Some(s) => s,
+            None => match make_stream(&config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("audio: failed to build input stream: {e}");
+                    return;
+                }
+            },
+        };
+        eprintln!("audio: using input buffer {chosen}");
+
+        if let Err(e) = stream.play() {
+            eprintln!("audio: failed to start stream: {e}");
+            if let Some(handle) = mmcss {
+                disable_mmcss_audio(handle);
+            }
+            return;
+        }
+
+        eprintln!("audio: streaming to {target}");
+        let pace_run = running.clone();
+        let pace_queue = sample_queue.clone();
+        let pace_sock = sock.clone();
+        let pace_seq = seq.clone();
+        let pace_pkts = pkt_count.clone();
+        thread::spawn(move || {
+            let send_interval =
+                Duration::from_secs_f64(AUDIO_SEND_FRAMES as f64 / audio::SAMPLE_RATE as f64);
+            let mut buf = [0u8; 1472];
+            let mut samples = [0f32; AUDIO_SEND_SAMPLES];
+            let mut next_send = Instant::now();
+
+            while pace_run.load(Ordering::Relaxed) {
+                let available = pace_queue.len();
+                if available == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                    next_send = Instant::now();
+                    continue;
+                }
+
+                let now = Instant::now();
+                if available < AUDIO_SEND_SAMPLES && now < next_send {
+                    thread::sleep(next_send - now);
+                    continue;
+                }
+
+                let count = available.min(AUDIO_SEND_SAMPLES);
+                for slot in samples.iter_mut().take(count) {
+                    *slot = pace_queue.pop().unwrap_or(0.0);
+                }
+
+                let packet_seq = pace_seq.fetch_add(1, Ordering::Relaxed);
+                let len =
+                    audio::audio_to_bytes(packet_seq, audio::CHANNELS, &samples[..count], &mut buf);
+                let _ = pace_sock.send_to(&buf[..len], target);
+                pace_pkts.fetch_add(1, Ordering::Relaxed);
+
+                next_send += send_interval;
+                let after_send = Instant::now();
+                if next_send <= after_send {
+                    next_send = after_send + send_interval;
+                }
+            }
+        });
+
+        let mut last_log = Instant::now();
+        while running.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(100));
+            if last_log.elapsed().as_secs() >= 5 {
+                let pkts = packets_sent.swap(0, Ordering::Relaxed);
+                let queued = sample_queue.len();
+                let latency_ms =
+                    queued as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
+                let dropped = queue_drops.swap(0, Ordering::Relaxed);
+                eprintln!(
+                    "audio: {pkts} pkts sent (5s), queued {queued}/{AUDIO_SEND_QUEUE_CAPACITY} ({latency_ms:.1}ms), dropped {dropped}"
+                );
+                last_log = Instant::now();
+            }
+        }
+        drop(stream);
+        if let Some(handle) = mmcss {
+            disable_mmcss_audio(handle);
+        }
+        eprintln!("audio: stopped");
+    });
+}
+
 fn main() {
     let log_file_path = redirect_stdio_to_log();
 
@@ -402,6 +640,8 @@ fn main() {
         let mut sender_connected = false;
         let mut last_heartbeat = Instant::now();
         let mut sender_addr: Option<SocketAddr> = None;
+        let mut audio_running: Option<Arc<AtomicBool>> = None;
+        let mut audio_target: Option<SocketAddr> = None;
 
         let release_all_keys = |keys: &mut HashSet<u16>| {
             for &k in keys.iter() {
@@ -421,6 +661,10 @@ fn main() {
                 {
                     if sender_connected && last_heartbeat.elapsed().as_secs() > 5 {
                         release_all_keys(&mut held_keys);
+                        if let Some(run) = audio_running.take() {
+                            run.store(false, Ordering::SeqCst);
+                        }
+                        audio_target = None;
                         eprintln!("WARNING: sender disconnected");
                         sender_connected = false;
                         state.store(AppState::Listening as u8, Ordering::SeqCst);
@@ -437,6 +681,10 @@ fn main() {
             if !sender_connected || sender_addr != Some(src) {
                 if sender_connected {
                     release_all_keys(&mut held_keys);
+                    if let Some(run) = audio_running.take() {
+                        run.store(false, Ordering::SeqCst);
+                    }
+                    audio_target = None;
                 }
                 println!("sender connected from {src}");
                 sender_addr = Some(src);
@@ -444,6 +692,15 @@ fn main() {
                 last_heartbeat = Instant::now();
                 state.store(AppState::Connected as u8, Ordering::SeqCst);
                 let _ = net_proxy.send_event(UserEvent::StateChanged);
+
+                let target = SocketAddr::new(src.ip(), audio::AUDIO_PORT);
+                if audio_target != Some(target) {
+                    thread::sleep(Duration::from_millis(50));
+                    let run = Arc::new(AtomicBool::new(true));
+                    start_audio_capture(target, run.clone());
+                    audio_running = Some(run);
+                    audio_target = Some(target);
+                }
             }
 
             match Event::from_bytes(&buf[..n]) {
