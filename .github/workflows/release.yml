@@ -22,7 +22,7 @@ jobs:
       - id: v
         shell: bash
         run: |
-          version="$(python3 -c "from datetime import datetime, timezone; ts = '${SOURCE_TIMESTAMP}'.replace('Z', '+00:00'); dt = datetime.fromisoformat(ts).astimezone(timezone.utc); print(f'{dt:%Y}.{dt.month}{dt:%d}.{dt.hour}{dt:%M}')")"
+          version="$(python3 -c "from datetime import datetime, timezone; ts = '${SOURCE_TIMESTAMP}'.replace('Z', '+00:00'); dt = datetime.fromisoformat(ts).astimezone(timezone.utc); print(f'{dt.year}.{dt.month * 100 + dt.day}.{dt.hour * 100 + dt.minute}')")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - shell: bash
         run: sed -i '' "1,5s/^version = \".*\"/version = \"${{ steps.v.outputs.version }}\"/" sender/Cargo.toml
@@ -58,7 +58,7 @@ jobs:
       - id: v
         shell: bash
         run: |
-          version="$(python3 -c "from datetime import datetime, timezone; ts = '${SOURCE_TIMESTAMP}'.replace('Z', '+00:00'); dt = datetime.fromisoformat(ts).astimezone(timezone.utc); print(f'{dt:%Y}.{dt.month}{dt:%d}.{dt.hour}{dt:%M}')")"
+          version="$(python3 -c "from datetime import datetime, timezone; ts = '${SOURCE_TIMESTAMP}'.replace('Z', '+00:00'); dt = datetime.fromisoformat(ts).astimezone(timezone.utc); print(f'{dt.year}.{dt.month * 100 + dt.day}.{dt.hour * 100 + dt.minute}')")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - shell: bash
         run: sed -i "1,5s/^version = \".*\"/version = \"${{ steps.v.outputs.version }}\"/" receiver/Cargo.toml
