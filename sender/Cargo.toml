@@ -9,8 +9,6 @@ hotswitch-proto = { path = "../proto" }
 tray-icon = "0.21"
 tao = "0.34"
 self_update = { version = "0.42", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
-cpal = "0.15"
-crossbeam-queue = "0.3.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
