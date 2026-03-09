@@ -1145,7 +1145,6 @@ name = "hotswitch-receiver"
 version = "0.1.0"
 dependencies = [
  "cpal",
- "crossbeam-queue",
  "hotswitch-proto",
  "self_update",
  "tao",

@@ -1,7 +1,6 @@
 #![windows_subsystem = "windows"]
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_queue::ArrayQueue;
 use hotswitch_proto::{audio, keymap, Event};
 use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
@@ -28,10 +27,6 @@ use windows::{
 };
 
 const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
-const AUDIO_SEND_FRAMES: u32 = 96;
-const AUDIO_SEND_SAMPLES: usize = AUDIO_SEND_FRAMES as usize * audio::CHANNELS as usize;
-const AUDIO_SEND_QUEUE_CAPACITY: usize =
-    (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
 
 #[cfg(windows)]
 type MmcssHandle = HANDLE;
@@ -450,16 +445,13 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         let run = running.clone();
         let packets_sent = Arc::new(AtomicU64::new(0));
         let pkt_count = packets_sent.clone();
-        let queue_drops = Arc::new(AtomicU64::new(0));
-        let drop_count = queue_drops.clone();
         let next_seq = Arc::new(AtomicU32::new(0));
         let seq = next_seq.clone();
-        let sample_queue = Arc::new(ArrayQueue::<f32>::new(AUDIO_SEND_QUEUE_CAPACITY));
-        let queue = sample_queue.clone();
         let make_stream = |config: &cpal::StreamConfig| {
             let run = run.clone();
-            let queue = queue.clone();
-            let drop_count = drop_count.clone();
+            let sock = sock.clone();
+            let pkt_count = pkt_count.clone();
+            let seq = seq.clone();
             let mut last_callback_frames = 0u32;
             device.build_input_stream(
                 config,
@@ -477,16 +469,13 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
                     if !run.load(Ordering::Relaxed) {
                         return;
                     }
-
-                    for &sample in data {
-                        while queue.len() >= AUDIO_SEND_QUEUE_CAPACITY {
-                            if queue.pop().is_some() {
-                                drop_count.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                break;
-                            }
-                        }
-                        let _ = queue.push(sample);
+                    let mut buf = [0u8; 1472];
+                    for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
+                        let packet_seq = seq.fetch_add(1, Ordering::Relaxed);
+                        let len =
+                            audio::audio_to_bytes(packet_seq, audio::CHANNELS, chunk, &mut buf);
+                        let _ = sock.send_to(&buf[..len], target);
+                        pkt_count.fetch_add(1, Ordering::Relaxed);
                     }
                 },
                 |err| eprintln!("audio: stream error: {err}"),
@@ -532,63 +521,12 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         }
 
         eprintln!("audio: streaming to {target}");
-        let pace_run = running.clone();
-        let pace_queue = sample_queue.clone();
-        let pace_sock = sock.clone();
-        let pace_seq = seq.clone();
-        let pace_pkts = pkt_count.clone();
-        thread::spawn(move || {
-            let send_interval =
-                Duration::from_secs_f64(AUDIO_SEND_FRAMES as f64 / audio::SAMPLE_RATE as f64);
-            let mut buf = [0u8; 1472];
-            let mut samples = [0f32; AUDIO_SEND_SAMPLES];
-            let mut next_send = Instant::now();
-
-            while pace_run.load(Ordering::Relaxed) {
-                let available = pace_queue.len();
-                if available == 0 {
-                    thread::sleep(Duration::from_millis(1));
-                    next_send = Instant::now();
-                    continue;
-                }
-
-                let now = Instant::now();
-                if available < AUDIO_SEND_SAMPLES && now < next_send {
-                    thread::sleep(next_send - now);
-                    continue;
-                }
-
-                let count = available.min(AUDIO_SEND_SAMPLES);
-                for slot in samples.iter_mut().take(count) {
-                    *slot = pace_queue.pop().unwrap_or(0.0);
-                }
-
-                let packet_seq = pace_seq.fetch_add(1, Ordering::Relaxed);
-                let len =
-                    audio::audio_to_bytes(packet_seq, audio::CHANNELS, &samples[..count], &mut buf);
-                let _ = pace_sock.send_to(&buf[..len], target);
-                pace_pkts.fetch_add(1, Ordering::Relaxed);
-
-                next_send += send_interval;
-                let after_send = Instant::now();
-                if next_send <= after_send {
-                    next_send = after_send + send_interval;
-                }
-            }
-        });
-
         let mut last_log = Instant::now();
         while running.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
             if last_log.elapsed().as_secs() >= 5 {
                 let pkts = packets_sent.swap(0, Ordering::Relaxed);
-                let queued = sample_queue.len();
-                let latency_ms =
-                    queued as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
-                let dropped = queue_drops.swap(0, Ordering::Relaxed);
-                eprintln!(
-                    "audio: {pkts} pkts sent (5s), queued {queued}/{AUDIO_SEND_QUEUE_CAPACITY} ({latency_ms:.1}ms), dropped {dropped}"
-                );
+                eprintln!("audio: {pkts} pkts sent (5s)");
                 last_log = Instant::now();
             }
         }
