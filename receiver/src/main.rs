@@ -547,20 +547,6 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         let mmcss = enable_mmcss_audio();
         let host = cpal::default_host();
 
-        // WASAPI loopback: use the default *output* device as an input source
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                eprintln!("audio: no output device for loopback capture");
-                if let Some(handle) = mmcss {
-                    disable_mmcss_audio(handle);
-                }
-                return;
-            }
-        };
-        let device_name = device.name().unwrap_or_default();
-        eprintln!("audio: capturing from {device_name}");
-
         let config = cpal::StreamConfig {
             channels: audio::CHANNELS,
             sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
@@ -584,82 +570,133 @@ fn start_audio_capture(target: SocketAddr, running: Arc<AtomicBool>) {
         let pkt_count = packets_sent.clone();
         let next_seq = Arc::new(AtomicU32::new(0));
         let seq = next_seq.clone();
-        let make_stream = |config: &cpal::StreamConfig| {
-            let run = run.clone();
-            let sock = sock.clone();
-            let pkt_count = pkt_count.clone();
-            let seq = seq.clone();
-            let mut last_callback_frames = 0u32;
-            device.build_input_stream(
-                config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
-                    if callback_frames != last_callback_frames {
-                        let callback_ms =
-                            callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
-                        eprintln!(
-                            "audio: input callback {callback_frames} frames ({callback_ms:.1}ms)"
-                        );
-                        last_callback_frames = callback_frames;
-                    }
 
-                    if !run.load(Ordering::Relaxed) {
-                        return;
+        let build_stream = || {
+            // WASAPI loopback: use the default *output* device as an input source
+            let device = match host.default_output_device() {
+                Some(d) => d,
+                None => {
+                    eprintln!("audio: no output device for loopback capture");
+                    return None;
+                }
+            };
+            let device_name = device.name().unwrap_or_default();
+            eprintln!("audio: capturing from {device_name}");
+
+            let make_stream = |config: &cpal::StreamConfig| {
+                let run = run.clone();
+                let sock = sock.clone();
+                let pkt_count = pkt_count.clone();
+                let seq = seq.clone();
+                let mut last_callback_frames = 0u32;
+                device.build_input_stream(
+                    config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
+                        if callback_frames != last_callback_frames {
+                            let callback_ms =
+                                callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
+                            eprintln!(
+                                "audio: input callback {callback_frames} frames ({callback_ms:.1}ms)"
+                            );
+                            last_callback_frames = callback_frames;
+                        }
+
+                        if !run.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let mut buf = [0u8; 1472];
+                        for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
+                            let packet_seq = seq.fetch_add(1, Ordering::Relaxed);
+                            let len =
+                                audio::audio_to_bytes(packet_seq, audio::CHANNELS, chunk, &mut buf);
+                            let _ = sock.send_to(&buf[..len], target);
+                            pkt_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                    |err| eprintln!("audio: stream error: {err}"),
+                    None,
+                )
+            };
+
+            let mut chosen = "default".to_string();
+            let mut stream = None;
+            for frames in AUDIO_BUFFER_CANDIDATES {
+                let trial = cpal::StreamConfig {
+                    channels: audio::CHANNELS,
+                    sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+                    buffer_size: cpal::BufferSize::Fixed(frames),
+                };
+                match make_stream(&trial) {
+                    Ok(s) => {
+                        chosen = format!("{frames} frames");
+                        stream = Some(s);
+                        break;
                     }
-                    let mut buf = [0u8; 1472];
-                    for chunk in data.chunks(audio::MAX_SAMPLES_PER_PACKET) {
-                        let packet_seq = seq.fetch_add(1, Ordering::Relaxed);
-                        let len =
-                            audio::audio_to_bytes(packet_seq, audio::CHANNELS, chunk, &mut buf);
-                        let _ = sock.send_to(&buf[..len], target);
-                        pkt_count.fetch_add(1, Ordering::Relaxed);
+                    Err(e) => eprintln!("audio: input buffer {frames} frames unsupported: {e}"),
+                }
+            }
+            let stream = match stream {
+                Some(s) => s,
+                None => match make_stream(&config) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("audio: failed to build input stream: {e}");
+                        return None;
                     }
                 },
-                |err| eprintln!("audio: stream error: {err}"),
-                None,
-            )
-        };
-
-        let mut chosen = "default".to_string();
-        let mut stream = None;
-        for frames in AUDIO_BUFFER_CANDIDATES {
-            let trial = cpal::StreamConfig {
-                channels: audio::CHANNELS,
-                sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Fixed(frames),
             };
-            match make_stream(&trial) {
-                Ok(s) => {
-                    chosen = format!("{frames} frames");
-                    stream = Some(s);
-                    break;
-                }
-                Err(e) => eprintln!("audio: input buffer {frames} frames unsupported: {e}"),
-            }
-        }
-        let stream = match stream {
-            Some(s) => s,
-            None => match make_stream(&config) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("audio: failed to build input stream: {e}");
-                    return;
-                }
-            },
-        };
-        eprintln!("audio: using input buffer {chosen}");
+            eprintln!("audio: using input buffer {chosen}");
 
-        if let Err(e) = stream.play() {
-            eprintln!("audio: failed to start stream: {e}");
-            if let Some(handle) = mmcss {
-                disable_mmcss_audio(handle);
+            if let Err(e) = stream.play() {
+                eprintln!("audio: failed to start stream: {e}");
+                return None;
             }
-            return;
-        }
+
+            Some((stream, device_name))
+        };
 
         eprintln!("audio: streaming to {target}");
+        let mut stream = None;
+        let mut active_device_name = String::new();
         let mut last_log = Instant::now();
+        let mut last_device_poll = Instant::now() - Duration::from_secs(10);
         while running.load(Ordering::Relaxed) {
+            if last_device_poll.elapsed().as_secs() >= 2 {
+                last_device_poll = Instant::now();
+                let current_default = host.default_output_device().and_then(|d| d.name().ok());
+                let device_changed = match current_default {
+                    Some(ref name) => name != &active_device_name,
+                    None => !active_device_name.is_empty(),
+                };
+                if stream.is_none() || device_changed {
+                    if device_changed {
+                        match current_default {
+                            Some(ref name) => {
+                                eprintln!(
+                                    "audio: default output changed from {} to {}",
+                                    active_device_name, name
+                                );
+                            }
+                            None => {
+                                eprintln!(
+                                    "audio: default output {} disappeared",
+                                    active_device_name
+                                );
+                            }
+                        }
+                    }
+
+                    if let Some((new_stream, new_device_name)) = build_stream() {
+                        stream = Some(new_stream);
+                        active_device_name = new_device_name;
+                    } else {
+                        stream = None;
+                        active_device_name.clear();
+                    }
+                }
+            }
+
             thread::sleep(Duration::from_millis(100));
             if last_log.elapsed().as_secs() >= 5 {
                 let pkts = packets_sent.swap(0, Ordering::Relaxed);
