@@ -286,120 +286,7 @@ fn start_audio_playback() {
         let underruns = Arc::new(AtomicU32::new(0));
         let trimmed = Arc::new(AtomicU32::new(0));
         let stale_packets = Arc::new(AtomicU32::new(0));
-
-        let make_stream = |config: &cpal::StreamConfig| {
-            let queue = queue.clone();
-            let buf_fill = buf_fill.clone();
-            let primed = primed.clone();
-            let underruns = underruns.clone();
-            let trimmed = trimmed.clone();
-            let mut last_callback_frames = 0u32;
-            let mut soft_trim_phase = 0u32;
-            device.build_output_stream(
-                config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
-                    if callback_frames != last_callback_frames {
-                        let callback_ms =
-                            callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
-                        eprintln!(
-                            "audio: output callback {callback_frames} frames ({callback_ms:.1}ms)"
-                        );
-                        last_callback_frames = callback_frames;
-                    }
-
-                    let mut buffered = buf_fill.load(Ordering::Relaxed) as usize;
-
-                    if buffered > AUDIO_RESET_FILL {
-                        let to_drop = buffered.saturating_sub(AUDIO_TARGET_FILL);
-                        for _ in 0..to_drop {
-                            if queue.pop().is_some() {
-                                buf_fill.fetch_sub(1, Ordering::Relaxed);
-                                trimmed.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                break;
-                            }
-                        }
-                        buffered = buf_fill.load(Ordering::Relaxed) as usize;
-                    }
-
-                    if !primed.load(Ordering::Relaxed) {
-                        if buffered < AUDIO_TARGET_FILL {
-                            data.fill(0.0);
-                            return;
-                        }
-                        primed.store(true, Ordering::Relaxed);
-                    }
-
-                    if buffered > AUDIO_BIAS_FILL {
-                        soft_trim_phase = soft_trim_phase.wrapping_add(1);
-                        if soft_trim_phase % 8 == 0 {
-                            for _ in 0..audio::CHANNELS as usize {
-                                if queue.pop().is_some() {
-                                    buf_fill.fetch_sub(1, Ordering::Relaxed);
-                                    trimmed.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    let mut underrun = false;
-                    for sample in data.iter_mut() {
-                        if let Some(v) = queue.pop() {
-                            *sample = v;
-                            buf_fill.fetch_sub(1, Ordering::Relaxed);
-                        } else {
-                            *sample = 0.0;
-                            underrun = true;
-                        }
-                    }
-
-                    if underrun {
-                        underruns.fetch_add(1, Ordering::Relaxed);
-                        primed.store(false, Ordering::Relaxed);
-                        buf_fill.store(queue.len() as u32, Ordering::Relaxed);
-                    }
-                },
-                |err| eprintln!("audio: playback error: {err}"),
-                None,
-            )
-        };
-
-        let mut chosen = "default".to_string();
-        let mut stream = None;
-        for frames in AUDIO_BUFFER_CANDIDATES {
-            let trial = cpal::StreamConfig {
-                channels: audio::CHANNELS,
-                sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Fixed(frames),
-            };
-            match make_stream(&trial) {
-                Ok(s) => {
-                    chosen = format!("{frames} frames");
-                    stream = Some(s);
-                    break;
-                }
-                Err(e) => eprintln!("audio: output buffer {frames} frames unsupported: {e}"),
-            }
-        }
-        let stream = match stream {
-            Some(s) => s,
-            None => match make_stream(&config) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("audio: failed to build output stream: {e}");
-                    return;
-                }
-            },
-        };
-        eprintln!("audio: using output buffer {chosen}");
-
-        if let Err(e) = stream.play() {
-            eprintln!("audio: failed to start playback: {e}");
-            return;
-        }
+        let needs_rebuild = Arc::new(AtomicBool::new(false));
 
         let socket = match UdpSocket::bind(format!("0.0.0.0:{}", audio::AUDIO_PORT)) {
             Ok(s) => s,
@@ -408,7 +295,146 @@ fn start_audio_playback() {
                 return;
             }
         };
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
         eprintln!("audio: listening on port {}", audio::AUDIO_PORT);
+
+        let build_stream = || {
+            let device = match host.default_output_device() {
+                Some(d) => d,
+                None => {
+                    eprintln!("audio: no output device");
+                    return None;
+                }
+            };
+            let device_name = device.name().unwrap_or_default();
+            eprintln!("audio: playing on {device_name}");
+
+            let make_stream = |config: &cpal::StreamConfig| {
+                let queue = queue.clone();
+                let buf_fill = buf_fill.clone();
+                let primed = primed.clone();
+                let underruns = underruns.clone();
+                let trimmed = trimmed.clone();
+                let needs_rebuild = needs_rebuild.clone();
+                let mut last_callback_frames = 0u32;
+                let mut soft_trim_phase = 0u32;
+                device.build_output_stream(
+                    config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        let callback_frames = (data.len() / audio::CHANNELS as usize) as u32;
+                        if callback_frames != last_callback_frames {
+                            let callback_ms =
+                                callback_frames as f32 / audio::SAMPLE_RATE as f32 * 1000.0;
+                            eprintln!(
+                                "audio: output callback {callback_frames} frames ({callback_ms:.1}ms)"
+                            );
+                            last_callback_frames = callback_frames;
+                        }
+
+                        let mut buffered = buf_fill.load(Ordering::Relaxed) as usize;
+
+                        if buffered > AUDIO_RESET_FILL {
+                            let to_drop = buffered.saturating_sub(AUDIO_TARGET_FILL);
+                            for _ in 0..to_drop {
+                                if queue.pop().is_some() {
+                                    buf_fill.fetch_sub(1, Ordering::Relaxed);
+                                    trimmed.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    break;
+                                }
+                            }
+                            buffered = buf_fill.load(Ordering::Relaxed) as usize;
+                        }
+
+                        if !primed.load(Ordering::Relaxed) {
+                            if buffered < AUDIO_TARGET_FILL {
+                                data.fill(0.0);
+                                return;
+                            }
+                            primed.store(true, Ordering::Relaxed);
+                        }
+
+                        if buffered > AUDIO_BIAS_FILL {
+                            soft_trim_phase = soft_trim_phase.wrapping_add(1);
+                            if soft_trim_phase % 8 == 0 {
+                                for _ in 0..audio::CHANNELS as usize {
+                                    if queue.pop().is_some() {
+                                        buf_fill.fetch_sub(1, Ordering::Relaxed);
+                                        trimmed.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut underrun = false;
+                        for sample in data.iter_mut() {
+                            if let Some(v) = queue.pop() {
+                                *sample = v;
+                                buf_fill.fetch_sub(1, Ordering::Relaxed);
+                            } else {
+                                *sample = 0.0;
+                                underrun = true;
+                            }
+                        }
+
+                        if underrun {
+                            underruns.fetch_add(1, Ordering::Relaxed);
+                            primed.store(false, Ordering::Relaxed);
+                            buf_fill.store(queue.len() as u32, Ordering::Relaxed);
+                        }
+                    },
+                    move |err| {
+                        eprintln!("audio: playback error: {err}");
+                        needs_rebuild.store(true, Ordering::SeqCst);
+                    },
+                    None,
+                )
+            };
+
+            let mut chosen = "default".to_string();
+            let mut stream = None;
+            for frames in AUDIO_BUFFER_CANDIDATES {
+                let trial = cpal::StreamConfig {
+                    channels: audio::CHANNELS,
+                    sample_rate: cpal::SampleRate(audio::SAMPLE_RATE),
+                    buffer_size: cpal::BufferSize::Fixed(frames),
+                };
+                match make_stream(&trial) {
+                    Ok(s) => {
+                        chosen = format!("{frames} frames");
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(e) => eprintln!("audio: output buffer {frames} frames unsupported: {e}"),
+                }
+            }
+            let stream = match stream {
+                Some(s) => s,
+                None => match make_stream(&config) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("audio: failed to build output stream: {e}");
+                        return None;
+                    }
+                },
+            };
+            eprintln!("audio: using output buffer {chosen}");
+
+            if let Err(e) = stream.play() {
+                eprintln!("audio: failed to start playback: {e}");
+                return None;
+            }
+
+            Some((stream, device_name))
+        };
+
+        let mut stream = None;
+        let mut active_device_name = String::new();
+        let mut last_device_poll = Instant::now() - Duration::from_secs(10);
 
         let buf_capacity = AUDIO_QUEUE_CAPACITY;
         let pkt_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -436,8 +462,49 @@ fn start_audio_playback() {
         let mut buf = [0u8; 1500];
         let mut last_seq = None;
         loop {
+            if last_device_poll.elapsed() >= Duration::from_secs(2) {
+                last_device_poll = Instant::now();
+                let current_default = host.default_output_device().and_then(|d| d.name().ok());
+                let device_changed = match current_default {
+                    Some(ref name) => name != &active_device_name,
+                    None => !active_device_name.is_empty(),
+                };
+                let should_rebuild = stream.is_none() || device_changed;
+                if should_rebuild || needs_rebuild.swap(false, Ordering::SeqCst) {
+                    if device_changed {
+                        match current_default {
+                            Some(ref name) => {
+                                eprintln!(
+                                    "audio: default output changed from {} to {}",
+                                    active_device_name, name
+                                );
+                            }
+                            None => {
+                                eprintln!(
+                                    "audio: default output {} disappeared",
+                                    active_device_name
+                                );
+                            }
+                        }
+                    }
+                    if let Some((new_stream, new_device_name)) = build_stream() {
+                        stream = Some(new_stream);
+                        active_device_name = new_device_name;
+                    } else {
+                        stream = None;
+                        active_device_name.clear();
+                    }
+                }
+            }
+
             let n = match socket.recv(&mut buf) {
                 Ok(n) => n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
                 Err(_) => continue,
             };
             if let Some((seq, _channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
