@@ -16,13 +16,13 @@ mod windows_service_main {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
-        TOKEN_ALL_ACCESS,
+        DuplicateTokenEx, OpenProcessToken, SecurityImpersonation, SetTokenInformation,
+        TokenPrimary, TokenSessionId, TOKEN_ALL_ACCESS,
     };
     use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess,
-        WaitForSingleObject, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, GetCurrentProcess, TerminateProcess, WaitForSingleObject,
+        PROCESS_INFORMATION, STARTUPINFOW,
     };
     use windows_service::{
         define_windows_service,
