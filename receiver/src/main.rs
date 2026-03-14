@@ -68,6 +68,10 @@ fn disable_mmcss_audio(_handle: MmcssHandle) {}
 #[cfg(windows)]
 mod inject {
     use std::ops::BitOrAssign;
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
+        DESKTOP_CONTROL_FLAGS,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
         KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -75,13 +79,12 @@ mod inject {
         MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
         MOUSEEVENTF_XUP, MOUSEINPUT,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CloseDesktop, OpenInputDesktop, SetThreadDesktop, XBUTTON1, XBUTTON2,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
     pub fn sync_input_desktop() {
         unsafe {
-            match OpenInputDesktop(0, false, 0x10000000) {
+            match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x10000000))
+            {
                 Ok(desktop) => {
                     if let Err(error) = SetThreadDesktop(desktop) {
                         eprintln!("SetThreadDesktop failed: {error}");
