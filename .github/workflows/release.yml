@@ -62,8 +62,19 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - shell: bash
         run: sed -i "1,5s/^version = \".*\"/version = \"${{ steps.v.outputs.version }}\"/" receiver/Cargo.toml
-      - run: cargo build --release -p hotswitch-receiver
-      - run: Compress-Archive -Path target/release/hotswitch-receiver.exe -DestinationPath hotswitch-receiver-x86_64-pc-windows-msvc.zip
+      - shell: bash
+        run: sed -i "1,5s/^version = \".*\"/version = \"${{ steps.v.outputs.version }}\"/" receiver-service/Cargo.toml
+      - run: cargo build --release -p hotswitch-receiver -p hotswitch-receiver-service
+      - run: |
+          Compress-Archive `
+            -Path @(
+              'target/release/hotswitch-receiver.exe',
+              'target/release/hotswitch-receiver-service.exe',
+              'scripts/install-hotswitch.ps1',
+              'scripts/start-hotswitch.ps1',
+              'scripts/uninstall-hotswitch.ps1'
+            ) `
+            -DestinationPath hotswitch-receiver-x86_64-pc-windows-msvc.zip
         shell: pwsh
       - uses: actions/upload-artifact@v4
         with:

@@ -1,5 +1,5 @@
 [workspace]
-members = ["proto", "sender", "receiver"]
+members = ["proto", "sender", "receiver", "receiver-service"]
 resolver = "2"
 
 [profile.release]

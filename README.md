@@ -33,7 +33,25 @@ hotswitch-sender 10.0.0.100:24801
 
 ### Receiver (Windows)
 
-Download `hotswitch-receiver.exe` from [Releases](https://github.com/aprets/hotswitch/releases) and run:
+Download the Windows release zip. It now contains:
+
+- `hotswitch-receiver.exe`
+- `hotswitch-receiver-service.exe`
+- `install-hotswitch.ps1`
+- `start-hotswitch.ps1`
+- `uninstall-hotswitch.ps1`
+
+Install or migrate from an elevated PowerShell prompt:
+
+```powershell
+.\install-hotswitch.ps1
+```
+
+The installer copies the files into `C:\Program Files\Hotswitch`, removes the old scheduled-task startup entry, creates or updates the `Hotswitch` Windows service, and starts it.
+
+The service launches `hotswitch-receiver.exe` into the active console session, where it owns the tray icon, audio loopback, and input injection.
+
+For development, you can still run the receiver directly:
 
 ```
 hotswitch-receiver.exe 0.0.0.0:24801
@@ -52,6 +70,8 @@ hotswitch-receiver.exe 0.0.0.0:24801
 - Start on Login
 - Quit
 
+On Windows, `Start on Login` now controls the `Hotswitch` service startup type. `Quit` stops the current service-backed receiver session. To bring it back in the same session, run `start-hotswitch.ps1` from `C:\Program Files\Hotswitch` or `Start-Service Hotswitch` from an elevated shell.
+
 ## Building from source
 
 Requires [Rust](https://rustup.rs/).
@@ -62,6 +82,7 @@ cargo build --release -p hotswitch-sender
 
 # Receiver (on Windows)
 cargo build --release -p hotswitch-receiver
+cargo build --release -p hotswitch-receiver-service
 
 # Protocol tests (any platform)
 cargo test -p hotswitch-proto
@@ -69,7 +90,12 @@ cargo test -p hotswitch-proto
 
 ## Releasing
 
-Every push to `main` triggers a GitHub Actions build that publishes both binaries as a release. The version is derived from the commit timestamp.
+Every push to `main` triggers a GitHub Actions build that publishes:
+
+- `hotswitch-sender-aarch64-apple-darwin.tar.gz`
+- `hotswitch-receiver-x86_64-pc-windows-msvc.zip`
+
+The Windows zip contains the receiver, the receiver service, and the install/uninstall scripts. The version is derived from the commit timestamp.
 
 ## Protocol
 
@@ -91,7 +117,19 @@ Plain UDP, 1-byte type tag, big-endian, no framing:
 hotswitch/
   proto/          Shared protocol library (Event types, keymap, icon generation)
   sender/         macOS sender (CGEventTap + UDP + tray icon)
-  receiver/       Windows receiver (UDP + SendInput + tray icon)
+  receiver/       Windows session receiver (UDP + SendInput + tray icon)
+  receiver-service/ Windows service that launches the receiver into the active session
+  scripts/        Windows install/uninstall helpers
+
+## Migrating an Existing Windows Install
+
+If you already have the old receiver installed and enabled via the old `Start on Login` scheduled-task path:
+
+1. Download the new Windows release zip and extract it.
+2. Open an elevated PowerShell prompt in that folder.
+3. Run `.\install-hotswitch.ps1`.
+
+That script removes the legacy scheduled task automatically, updates the binaries in `C:\Program Files\Hotswitch`, creates or updates the Windows service, and starts it. You do not need to disable the old startup entry first.
 ```
 
 ## Acknowledgements

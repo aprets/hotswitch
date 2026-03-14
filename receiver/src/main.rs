@@ -75,7 +75,25 @@ mod inject {
         MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
         MOUSEEVENTF_XUP, MOUSEINPUT,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CloseDesktop, OpenInputDesktop, SetThreadDesktop, XBUTTON1, XBUTTON2,
+    };
+
+    pub fn sync_input_desktop() {
+        unsafe {
+            match OpenInputDesktop(0, false, 0x10000000) {
+                Ok(desktop) => {
+                    if let Err(error) = SetThreadDesktop(desktop) {
+                        eprintln!("SetThreadDesktop failed: {error}");
+                    }
+                    let _ = CloseDesktop(desktop);
+                }
+                Err(error) => {
+                    eprintln!("OpenInputDesktop failed: {error}");
+                }
+            }
+        }
+    }
 
     fn send_input_safe(input: INPUT) {
         unsafe {
@@ -84,6 +102,7 @@ mod inject {
                     return;
                 }
                 if attempt < 4 {
+                    sync_input_desktop();
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
@@ -188,6 +207,7 @@ mod inject {
 
 #[cfg(not(windows))]
 mod inject {
+    pub fn sync_input_desktop() {}
     pub fn rel_mouse(_dx: i32, _dy: i32) {}
     pub fn mouse_button(_button: u8, _pressed: bool) {}
     pub fn scroll(_dx: i16, _dy: i16) {}
@@ -236,6 +256,7 @@ enum UserEvent {
     Menu(tray_icon::menu::MenuEvent),
 }
 
+#[cfg(windows)]
 fn icon_size() -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
@@ -244,6 +265,11 @@ fn icon_size() -> u32 {
     } else {
         32
     }
+}
+
+#[cfg(not(windows))]
+fn icon_size() -> u32 {
+    32
 }
 
 fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
@@ -269,7 +295,27 @@ fn check_for_update() -> Option<String> {
     }
 }
 
-fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
+enum UpdateAction {
+    #[cfg(windows)]
+    ExitForInstaller,
+    RelaunchSelf(self_update::Status),
+}
+
+#[cfg(windows)]
+fn apply_update(version: Option<&str>) -> Result<UpdateAction, Box<dyn std::error::Error>> {
+    if let Some(script_path) = install_script_path() {
+        let version = version.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no release version available")
+        })?;
+        let wait_pid = std::process::id().to_string();
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script_path)
+            .args(["-ReleaseTag", version, "-WaitPid", &wait_pid])
+            .spawn()?;
+        return Ok(UpdateAction::ExitForInstaller);
+    }
+
     let status = self_update::backends::github::Update::configure()
         .repo_owner("aprets")
         .repo_name("hotswitch")
@@ -280,7 +326,22 @@ fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
         .show_output(false)
         .build()?
         .update()?;
-    Ok(status)
+    Ok(UpdateAction::RelaunchSelf(status))
+}
+
+#[cfg(not(windows))]
+fn apply_update(_version: Option<&str>) -> Result<UpdateAction, Box<dyn std::error::Error>> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("aprets")
+        .repo_name("hotswitch")
+        .bin_name("hotswitch-receiver")
+        .current_version(self_update::cargo_crate_version!())
+        .no_confirm(true)
+        .show_download_progress(false)
+        .show_output(false)
+        .build()?
+        .update()?;
+    Ok(UpdateAction::RelaunchSelf(status))
 }
 
 // --- Log file ---
@@ -288,8 +349,10 @@ fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
 fn log_path() -> PathBuf {
     #[cfg(windows)]
     {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| "C:\\".to_string());
-        let dir = PathBuf::from(appdata).join("hotswitch");
+        let base = std::env::var("PROGRAMDATA")
+            .or_else(|_| std::env::var("APPDATA"))
+            .unwrap_or_else(|_| "C:\\".to_string());
+        let dir = PathBuf::from(base).join("hotswitch");
         let _ = std::fs::create_dir_all(&dir);
         dir.join("receiver.log")
     }
@@ -349,51 +412,117 @@ fn open_log(path: &PathBuf) {
     let _ = std::process::Command::new(cmd).arg(path).spawn();
 }
 
-// --- Start on Login (Task Scheduler, runs elevated) ---
+// --- Start on Login (Windows service startup type) ---
 
-const TASK_NAME: &str = "Hotswitch";
+#[cfg(windows)]
+const SERVICE_NAME: &str = "Hotswitch";
 
 #[cfg(windows)]
 fn is_login_item() -> bool {
-    std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", TASK_NAME])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+    service_start_type()
+        .map(|start_type| start_type.contains("AUTO_START"))
         .unwrap_or(false)
 }
 
 #[cfg(windows)]
 fn set_login_item(enabled: bool) -> bool {
-    if enabled {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("failed to get current exe path: {e}");
-                return false;
-            }
-        };
-        let exe_str = exe.to_string_lossy().to_string();
-        std::process::Command::new("schtasks")
-            .args([
-                "/Create", "/F", "/TN", TASK_NAME, "/TR", &exe_str, "/SC", "ONLOGON", "/RL",
-                "HIGHEST", "/IT",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    } else {
-        std::process::Command::new("schtasks")
-            .args(["/Delete", "/F", "/TN", TASK_NAME])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    let start_mode = if enabled { "auto" } else { "demand" };
+    let updated = std::process::Command::new("sc")
+        .args(["config", SERVICE_NAME, "start=", start_mode])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !updated {
+        return false;
     }
+    if enabled {
+        start_service()
+    } else {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn service_start_type() -> Option<String> {
+    let output = std::process::Command::new("sc")
+        .args(["qc", SERVICE_NAME])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout
+        .lines()
+        .find(|line| line.contains("START_TYPE"))
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(windows)]
+fn service_is_running() -> bool {
+    let output = std::process::Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output()
+        .ok();
+    let Some(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8(output.stdout).ok();
+    stdout
+        .as_deref()
+        .map(|body| body.lines().any(|line| line.contains("RUNNING")))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn start_service() -> bool {
+    if service_is_running() {
+        return true;
+    }
+    std::process::Command::new("sc")
+        .args(["start", SERVICE_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn stop_service() -> bool {
+    if !service_is_running() {
+        return true;
+    }
+    std::process::Command::new("sc")
+        .args(["stop", SERVICE_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn install_script_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.with_file_name("install-hotswitch.ps1");
+    path.exists().then_some(path)
+}
+
+#[cfg(not(windows))]
+fn service_start_type() -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
+fn stop_service() -> bool {
+    true
 }
 
 #[cfg(not(windows))]
@@ -581,6 +710,8 @@ fn main() {
         let mut audio_running: Option<Arc<AtomicBool>> = None;
         let mut audio_target: Option<SocketAddr> = None;
 
+        inject::sync_input_desktop();
+
         let release_all_keys = |keys: &mut HashSet<u16>| {
             for &k in keys.iter() {
                 if let Some((sc, ext)) = keymap::cg_to_win_scancode(k) {
@@ -703,7 +834,8 @@ fn main() {
     let menu = Menu::new();
     let status_item = MenuItem::new(AppState::Listening.status_text(), false, None);
     let log_item = MenuItem::new("Show Log", true, None);
-    let login_item = CheckMenuItem::new("Start on Login", true, is_login_item(), None);
+    let service_managed = service_start_type().is_some();
+    let login_item = CheckMenuItem::new("Start on Login", service_managed, is_login_item(), None);
     let quit_item = MenuItem::new("Quit", true, None);
     let _ = menu.append_items(&[
         &status_item,
@@ -762,13 +894,22 @@ fn main() {
                 }
                 UserEvent::Menu(me) => {
                     if me.id == quit_id {
+                        if service_start_type().is_some() {
+                            let _ = stop_service();
+                        }
                         *control_flow = ControlFlow::Exit;
                     } else if me.id == update_id {
                         let exe = std::env::current_exe().expect("Failed to get current exe path");
+                        let latest_version = check_for_update();
                         update_item.set_text("Updating...");
                         update_item.set_enabled(false);
-                        match apply_update() {
-                            Ok(status) => {
+                        match apply_update(latest_version.as_deref()) {
+                            #[cfg(windows)]
+                            Ok(UpdateAction::ExitForInstaller) => {
+                                *control_flow = ControlFlow::Exit;
+                                return;
+                            }
+                            Ok(UpdateAction::RelaunchSelf(status)) => {
                                 eprintln!("update result: {status}");
                                 if status.updated() {
                                     let args: Vec<String> = std::env::args().skip(1).collect();

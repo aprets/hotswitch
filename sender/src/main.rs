@@ -2,12 +2,12 @@ use core_foundation::{base::TCFType, boolean::CFBoolean, runloop::CFRunLoop, str
 use core_graphics::{
     display::CGDisplay,
     event::{
-        CallbackResult, CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-        CGEventTapPlacement, CGEventTapProxy, CGEventType, EventField,
+        CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
+        CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
     },
 };
-use crossbeam_queue::ArrayQueue;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam_queue::ArrayQueue;
 use hotswitch_proto::{audio, Event};
 use std::{
     collections::HashSet,
@@ -112,11 +112,8 @@ fn check_for_update() -> Option<String> {
         .fetch()
         .ok()?;
     let latest = releases.first()?;
-    if self_update::version::bump_is_greater(
-        self_update::cargo_crate_version!(),
-        &latest.version,
-    )
-    .unwrap_or(false)
+    if self_update::version::bump_is_greater(self_update::cargo_crate_version!(), &latest.version)
+        .unwrap_or(false)
     {
         Some(latest.version.clone())
     } else {
@@ -243,14 +240,23 @@ fn set_login_item(enabled: bool, target_addr: &str) -> bool {
             let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::write(&path, plist) {
-            Ok(()) => { eprintln!("wrote launch agent: {}", path.display()); true }
-            Err(e) => { eprintln!("failed to write launch agent: {e}"); false }
+            Ok(()) => {
+                eprintln!("wrote launch agent: {}", path.display());
+                true
+            }
+            Err(e) => {
+                eprintln!("failed to write launch agent: {e}");
+                false
+            }
         }
     } else {
         match std::fs::remove_file(&path) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => { eprintln!("failed to remove launch agent: {e}"); false }
+            Err(e) => {
+                eprintln!("failed to remove launch agent: {e}");
+                false
+            }
         }
     }
 }
@@ -416,7 +422,8 @@ fn start_audio_playback() {
                 thread::sleep(Duration::from_secs(5));
                 let pkts = pkt_count.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let fill = buf_fill.load(std::sync::atomic::Ordering::Relaxed) as usize;
-                let latency_ms = fill as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
+                let latency_ms =
+                    fill as f32 / (audio::SAMPLE_RATE as f32 * audio::CHANNELS as f32) * 1000.0;
                 let underruns = underruns.swap(0, Ordering::Relaxed);
                 let trimmed = trimmed.swap(0, Ordering::Relaxed);
                 let stale = stale_packets.swap(0, Ordering::Relaxed);
@@ -548,154 +555,176 @@ fn main() {
         CGEventType::FlagsChanged,
     ];
 
-    let event_tap_callback =
-        move |_proxy: CGEventTapProxy, event_type: CGEventType, cg_ev: &CGEvent| -> CallbackResult {
-            if matches!(
-                event_type,
-                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-            ) {
-                eprintln!("WARNING: CGEventTap was disabled, re-enabling");
-                let port = tp.load(Ordering::SeqCst);
-                if !port.is_null() {
-                    unsafe { CGEventTapEnable(port, true); }
+    let event_tap_callback = move |_proxy: CGEventTapProxy,
+                                   event_type: CGEventType,
+                                   cg_ev: &CGEvent|
+          -> CallbackResult {
+        if matches!(
+            event_type,
+            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+        ) {
+            eprintln!("WARNING: CGEventTap was disabled, re-enabling");
+            let port = tp.load(Ordering::SeqCst);
+            if !port.is_null() {
+                unsafe {
+                    CGEventTapEnable(port, true);
                 }
-                return CallbackResult::Keep;
             }
+            return CallbackResult::Keep;
+        }
 
-            if matches!(event_type, CGEventType::KeyDown) {
-                let keycode = cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                if keycode == HOTKEY_KEYCODE {
-                    let flags = cg_ev.get_flags();
-                    let ctrl_held = flags.contains(CGEventFlags::CGEventFlagControl);
-                    if ctrl_held || !HOTKEY_REQUIRES_CTRL {
-                        let was_capturing = cap.load(Ordering::SeqCst);
-                        if !was_capturing && !rc_tap.load(Ordering::SeqCst) {
-                            let _ = proxy_tap.send_event(UserEvent::CaptureBlocked);
-                            return CallbackResult::Drop;
-                        }
-                        let now_capturing = !was_capturing;
-                        cap.store(now_capturing, Ordering::SeqCst);
-                        eprintln!("capture {}", if now_capturing { "started" } else { "stopped" });
-
-                        if now_capturing {
-                            unsafe { CGAssociateMouseAndMouseCursorPosition(false); }
-                            let _ = CGDisplay::hide_cursor(&CGDisplay::main());
-                            *adx.lock().unwrap() = 0.0;
-                            *ady.lock().unwrap() = 0.0;
-                        } else {
-                            unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
-                            let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                            let held: Vec<u16> = keys.lock().unwrap().drain().collect();
-                            let mut buf = [0u8; 64];
-                            for keycode in held {
-                                let evt = Event::Key { keycode, pressed: false };
-                                let len = evt.to_bytes(&mut buf);
-                                let _ = sock.send(&buf[..len]);
-                            }
-                        }
-                        compute_tap();
-                        let _ = proxy_tap.send_event(UserEvent::StateChanged);
+        if matches!(event_type, CGEventType::KeyDown) {
+            let keycode = cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+            if keycode == HOTKEY_KEYCODE {
+                let flags = cg_ev.get_flags();
+                let ctrl_held = flags.contains(CGEventFlags::CGEventFlagControl);
+                if ctrl_held || !HOTKEY_REQUIRES_CTRL {
+                    let was_capturing = cap.load(Ordering::SeqCst);
+                    if !was_capturing && !rc_tap.load(Ordering::SeqCst) {
+                        let _ = proxy_tap.send_event(UserEvent::CaptureBlocked);
                         return CallbackResult::Drop;
                     }
+                    let now_capturing = !was_capturing;
+                    cap.store(now_capturing, Ordering::SeqCst);
+                    eprintln!(
+                        "capture {}",
+                        if now_capturing { "started" } else { "stopped" }
+                    );
+
+                    if now_capturing {
+                        unsafe {
+                            CGAssociateMouseAndMouseCursorPosition(false);
+                        }
+                        let _ = CGDisplay::hide_cursor(&CGDisplay::main());
+                        *adx.lock().unwrap() = 0.0;
+                        *ady.lock().unwrap() = 0.0;
+                    } else {
+                        unsafe {
+                            CGAssociateMouseAndMouseCursorPosition(true);
+                        }
+                        let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                        let held: Vec<u16> = keys.lock().unwrap().drain().collect();
+                        let mut buf = [0u8; 64];
+                        for keycode in held {
+                            let evt = Event::Key {
+                                keycode,
+                                pressed: false,
+                            };
+                            let len = evt.to_bytes(&mut buf);
+                            let _ = sock.send(&buf[..len]);
+                        }
+                    }
+                    compute_tap();
+                    let _ = proxy_tap.send_event(UserEvent::StateChanged);
+                    return CallbackResult::Drop;
                 }
             }
+        }
 
-            if !cap.load(Ordering::SeqCst) {
-                return CallbackResult::Keep;
-            }
+        if !cap.load(Ordering::SeqCst) {
+            return CallbackResult::Keep;
+        }
 
-            let mut buf = [0u8; 64];
+        let mut buf = [0u8; 64];
 
-            match event_type {
-                CGEventType::MouseMoved
-                | CGEventType::LeftMouseDragged
-                | CGEventType::RightMouseDragged
-                | CGEventType::OtherMouseDragged => {
-                    let raw_dx = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
-                    let raw_dy = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-                    let mut ax = adx.lock().unwrap();
-                    let mut ay = ady.lock().unwrap();
-                    *ax += raw_dx;
-                    *ay += raw_dy;
-                    let dx = (*ax).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                    let dy = (*ay).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                    *ax -= dx as f64;
-                    *ay -= dy as f64;
-                    if dx != 0 || dy != 0 {
-                        let evt = Event::MouseMove { dx, dy };
-                        let len = evt.to_bytes(&mut buf);
-                        let _ = sock.send(&buf[..len]);
-                    }
-                }
-
-                CGEventType::LeftMouseDown
-                | CGEventType::LeftMouseUp
-                | CGEventType::RightMouseDown
-                | CGEventType::RightMouseUp
-                | CGEventType::OtherMouseDown
-                | CGEventType::OtherMouseUp => {
-                    if let Some((button, pressed)) = map_mouse_button(&event_type, cg_ev) {
-                        let evt = Event::MouseButton { button, pressed };
-                        let len = evt.to_bytes(&mut buf);
-                        let _ = sock.send(&buf[..len]);
-                    }
-                }
-
-                CGEventType::ScrollWheel => {
-                    let v = cg_ev
-                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
-                        as i16;
-                    let h = cg_ev
-                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
-                        as i16;
-                    if v != 0 || h != 0 {
-                        let evt = Event::Scroll { dx: h, dy: v };
-                        let len = evt.to_bytes(&mut buf);
-                        let _ = sock.send(&buf[..len]);
-                    }
-                }
-
-                CGEventType::KeyDown => {
-                    let keycode =
-                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                    keys.lock().unwrap().insert(keycode);
-                    let evt = Event::Key { keycode, pressed: true };
+        match event_type {
+            CGEventType::MouseMoved
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged => {
+                let raw_dx = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                let raw_dy = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                let mut ax = adx.lock().unwrap();
+                let mut ay = ady.lock().unwrap();
+                *ax += raw_dx;
+                *ay += raw_dy;
+                let dx = (*ax).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                let dy = (*ay).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                *ax -= dx as f64;
+                *ay -= dy as f64;
+                if dx != 0 || dy != 0 {
+                    let evt = Event::MouseMove { dx, dy };
                     let len = evt.to_bytes(&mut buf);
                     let _ = sock.send(&buf[..len]);
                 }
-                CGEventType::KeyUp => {
-                    let keycode =
-                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                    keys.lock().unwrap().remove(&keycode);
-                    let evt = Event::Key { keycode, pressed: false };
-                    let len = evt.to_bytes(&mut buf);
-                    let _ = sock.send(&buf[..len]);
-                }
-                CGEventType::FlagsChanged => {
-                    let keycode =
-                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                    let flags = cg_ev.get_flags();
-                    let mut k = keys.lock().unwrap();
-                    let pressed = match keycode {
-                        0x38 | 0x3C => flags.contains(CGEventFlags::CGEventFlagShift),
-                        0x3B | 0x3E => flags.contains(CGEventFlags::CGEventFlagControl),
-                        0x3A | 0x3D => flags.contains(CGEventFlags::CGEventFlagAlternate),
-                        0x37 | 0x36 => flags.contains(CGEventFlags::CGEventFlagCommand),
-                        0x39 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
-                        _ => !k.contains(&keycode),
-                    };
-                    if pressed { k.insert(keycode); } else { k.remove(&keycode); }
-                    drop(k);
-                    let evt = Event::Key { keycode, pressed };
-                    let len = evt.to_bytes(&mut buf);
-                    let _ = sock.send(&buf[..len]);
-                }
-
-                _ => {}
             }
 
-            CallbackResult::Drop
-        };
+            CGEventType::LeftMouseDown
+            | CGEventType::LeftMouseUp
+            | CGEventType::RightMouseDown
+            | CGEventType::RightMouseUp
+            | CGEventType::OtherMouseDown
+            | CGEventType::OtherMouseUp => {
+                if let Some((button, pressed)) = map_mouse_button(&event_type, cg_ev) {
+                    let evt = Event::MouseButton { button, pressed };
+                    let len = evt.to_bytes(&mut buf);
+                    let _ = sock.send(&buf[..len]);
+                }
+            }
+
+            CGEventType::ScrollWheel => {
+                let v = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
+                    as i16;
+                let h = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
+                    as i16;
+                if v != 0 || h != 0 {
+                    let evt = Event::Scroll { dx: h, dy: v };
+                    let len = evt.to_bytes(&mut buf);
+                    let _ = sock.send(&buf[..len]);
+                }
+            }
+
+            CGEventType::KeyDown => {
+                let keycode =
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                keys.lock().unwrap().insert(keycode);
+                let evt = Event::Key {
+                    keycode,
+                    pressed: true,
+                };
+                let len = evt.to_bytes(&mut buf);
+                let _ = sock.send(&buf[..len]);
+            }
+            CGEventType::KeyUp => {
+                let keycode =
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                keys.lock().unwrap().remove(&keycode);
+                let evt = Event::Key {
+                    keycode,
+                    pressed: false,
+                };
+                let len = evt.to_bytes(&mut buf);
+                let _ = sock.send(&buf[..len]);
+            }
+            CGEventType::FlagsChanged => {
+                let keycode =
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                let flags = cg_ev.get_flags();
+                let mut k = keys.lock().unwrap();
+                let pressed = match keycode {
+                    0x38 | 0x3C => flags.contains(CGEventFlags::CGEventFlagShift),
+                    0x3B | 0x3E => flags.contains(CGEventFlags::CGEventFlagControl),
+                    0x3A | 0x3D => flags.contains(CGEventFlags::CGEventFlagAlternate),
+                    0x37 | 0x36 => flags.contains(CGEventFlags::CGEventFlagCommand),
+                    0x39 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
+                    _ => !k.contains(&keycode),
+                };
+                if pressed {
+                    k.insert(keycode);
+                } else {
+                    k.remove(&keycode);
+                }
+                drop(k);
+                let evt = Event::Key { keycode, pressed };
+                let len = evt.to_bytes(&mut buf);
+                let _ = sock.send(&buf[..len]);
+            }
+
+            _ => {}
+        }
+
+        CallbackResult::Drop
+    };
 
     let tap = CGEventTap::new(
         CGEventTapLocation::Session,
@@ -706,7 +735,10 @@ fn main() {
     )
     .expect("Failed to create CGEventTap — is Accessibility permission granted?");
 
-    tap_port.store(tap.mach_port().as_CFTypeRef() as *mut c_void, Ordering::SeqCst);
+    tap_port.store(
+        tap.mach_port().as_CFTypeRef() as *mut c_void,
+        Ordering::SeqCst,
+    );
 
     let source = tap
         .mach_port()
@@ -714,7 +746,8 @@ fn main() {
         .expect("Failed to create runloop source");
 
     unsafe {
-        CFRunLoop::get_current().add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
+        CFRunLoop::get_current()
+            .add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
     }
 
     // --- Heartbeat listener thread ---
@@ -839,7 +872,9 @@ fn main() {
             _ => ControlFlow::Wait,
         };
 
-        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) = &event {
+        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) =
+            &event
+        {
             let now = Instant::now();
             if flash_until.map_or(false, |d| now >= d) {
                 flash_until = None;
@@ -871,7 +906,8 @@ fn main() {
                     update_item.set_text(format!("Update to v{ver}"));
                 }
                 UserEvent::CaptureBlocked => {
-                    let _ = tray.set_icon_with_as_template(Some(make_icon(220, 38, 38, true)), false);
+                    let _ =
+                        tray.set_icon_with_as_template(Some(make_icon(220, 38, 38, true)), false);
                     let _ = tray.set_tooltip(Some("Hotswitch — No receiver"));
                     let deadline = Instant::now() + Duration::from_secs(2);
                     flash_until = Some(deadline);
@@ -880,7 +916,9 @@ fn main() {
                 UserEvent::Menu(me) => {
                     if me.id == quit_id {
                         if capturing.load(Ordering::SeqCst) {
-                            unsafe { CGAssociateMouseAndMouseCursorPosition(true); }
+                            unsafe {
+                                CGAssociateMouseAndMouseCursorPosition(true);
+                            }
                             let _ = CGDisplay::show_cursor(&CGDisplay::main());
                         }
                         *control_flow = ControlFlow::Exit;
@@ -895,7 +933,7 @@ fn main() {
                                     let args: Vec<String> = std::env::args().skip(1).collect();
                                     eprintln!("relaunching: {exe:?} {args:?}");
                                     match std::process::Command::new(&exe).args(&args).spawn() {
-                                        Ok(_) => {},
+                                        Ok(_) => {}
                                         Err(e) => eprintln!("relaunch failed: {e}"),
                                     }
                                     *control_flow = ControlFlow::Exit;
@@ -917,7 +955,10 @@ fn main() {
                         }
                         update_item.set_enabled(true);
                     } else if me.id == log_id {
-                        let _ = std::process::Command::new("open").arg("-t").arg(&log_file_path).spawn();
+                        let _ = std::process::Command::new("open")
+                            .arg("-t")
+                            .arg(&log_file_path)
+                            .spawn();
                     } else if me.id == login_id {
                         if set_login_item(!login_checked, &addr_for_login) {
                             login_checked = !login_checked;
