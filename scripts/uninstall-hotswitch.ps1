@@ -27,7 +27,10 @@ if ($service) {
   sc.exe delete $serviceName | Out-Null
 }
 
-schtasks.exe /Delete /F /TN $serviceName *> $null
+$task = Get-ScheduledTask -TaskName $serviceName -ErrorAction SilentlyContinue
+if ($task) {
+  Unregister-ScheduledTask -TaskName $serviceName -Confirm:$false | Out-Null
+}
 
 Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue |
   Remove-NetFirewallRule -ErrorAction SilentlyContinue

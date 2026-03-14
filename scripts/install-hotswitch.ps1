@@ -58,20 +58,40 @@ function Stop-HotswitchReceiverProcesses {
 }
 
 function Remove-LegacyStartupTask {
-  schtasks.exe /Delete /F /TN $serviceName *> $null
+  $task = Get-ScheduledTask -TaskName $serviceName -ErrorAction SilentlyContinue
+  if ($task) {
+    Unregister-ScheduledTask -TaskName $serviceName -Confirm:$false | Out-Null
+  }
 }
 
 function Resolve-PayloadDir {
   if ($ReleaseTag) {
     $tempRoot = Join-Path $env:TEMP ("hotswitch-update-" + [guid]::NewGuid().ToString('N'))
-    $zipPath = Join-Path $tempRoot $archiveName
-    $extractDir = Join-Path $tempRoot 'payload'
     New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 
-    $zipUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$ReleaseTag/$archiveName"
-    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
-    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-    return $extractDir
+    $tagsToTry = @($ReleaseTag)
+    if (-not $ReleaseTag.StartsWith('v')) {
+      $tagsToTry = @("v$ReleaseTag", $ReleaseTag)
+    }
+
+    $lastError = $null
+    foreach ($tag in ($tagsToTry | Select-Object -Unique)) {
+      $zipPath = Join-Path $tempRoot ($tag + '-' + $archiveName)
+      $extractDir = Join-Path $tempRoot ('payload-' + $tag)
+      $zipUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/$archiveName"
+
+      try {
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+        return $extractDir
+      } catch {
+        $lastError = $_
+      }
+    }
+
+    if ($lastError) {
+      throw $lastError
+    }
   }
 
   if ($SourceDir) {

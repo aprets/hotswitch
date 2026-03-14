@@ -310,11 +310,16 @@ fn apply_update(version: Option<&str>) -> Result<UpdateAction, Box<dyn std::erro
         let version = version.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "no release version available")
         })?;
+        let release_tag = if version.starts_with('v') {
+            version.to_string()
+        } else {
+            format!("v{version}")
+        };
         let wait_pid = std::process::id().to_string();
         std::process::Command::new("powershell")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(script_path)
-            .args(["-ReleaseTag", version, "-WaitPid", &wait_pid])
+            .args(["-ReleaseTag", &release_tag, "-WaitPid", &wait_pid])
             .spawn()?;
         return Ok(UpdateAction::ExitForInstaller);
     }
