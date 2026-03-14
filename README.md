@@ -48,6 +48,7 @@ Install or migrate from an elevated PowerShell prompt:
 ```
 
 The installer copies the files into `C:\Program Files\Hotswitch`, removes the old scheduled-task startup entry, creates or updates the `Hotswitch` Windows service, and starts it.
+It also creates the required Private-network inbound Windows Firewall rule for the installed receiver on UDP `24801`.
 
 The service launches `hotswitch-receiver.exe` into the active console session, where it owns the tray icon, audio loopback, and input injection.
 

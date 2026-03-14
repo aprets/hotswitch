@@ -11,6 +11,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $serviceName = 'Hotswitch'
+$firewallRuleName = 'Hotswitch Receiver UDP 24801'
 $archiveName = 'hotswitch-receiver-x86_64-pc-windows-msvc.zip'
 $requiredFiles = @(
   'hotswitch-receiver.exe',
@@ -99,6 +100,20 @@ function Install-ServiceBinary([string]$ServiceExe) {
   }
 }
 
+function Install-FirewallRule([string]$ReceiverExe) {
+  Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+  New-NetFirewallRule `
+    -DisplayName $firewallRuleName `
+    -Direction Inbound `
+    -Profile Private `
+    -Action Allow `
+    -Protocol UDP `
+    -LocalPort 24801 `
+    -Program $ReceiverExe | Out-Null
+}
+
 Assert-Admin
 
 if ($WaitPid -gt 0) {
@@ -117,7 +132,9 @@ foreach ($file in $requiredFiles) {
   Copy-Item -Force (Join-Path $payloadDir $file) (Join-Path $InstallDir $file)
 }
 
+$receiverExe = Join-Path $InstallDir 'hotswitch-receiver.exe'
 $serviceExe = Join-Path $InstallDir 'hotswitch-receiver-service.exe'
+Install-FirewallRule -ReceiverExe $receiverExe
 Install-ServiceBinary -ServiceExe $serviceExe
 sc.exe start $serviceName | Out-Null
 

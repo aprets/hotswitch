@@ -6,6 +6,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $serviceName = 'Hotswitch'
+$firewallRuleName = 'Hotswitch Receiver UDP 24801'
 
 function Assert-Admin {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -27,6 +28,9 @@ if ($service) {
 }
 
 schtasks.exe /Delete /F /TN $serviceName *> $null
+
+Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue |
+  Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
 Get-Process -ErrorAction SilentlyContinue |
   Where-Object {
