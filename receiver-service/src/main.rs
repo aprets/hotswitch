@@ -10,19 +10,18 @@ mod windows_service_main {
     use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-    use std::ptr::null;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Security::{
-        DuplicateTokenEx, OpenProcessToken, SecurityImpersonation, SetTokenInformation,
-        TokenPrimary, TokenSessionId, TOKEN_ALL_ACCESS,
+        DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary,
+        TokenSessionId, TOKEN_ALL_ACCESS,
     };
     use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, TerminateProcess, WaitForSingleObject,
-        PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION,
+        STARTUPINFOW, TerminateProcess, WaitForSingleObject,
     };
     use windows_service::{
         define_windows_service,
