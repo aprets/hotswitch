@@ -5,6 +5,8 @@ use core_graphics::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
         CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
     },
+    event_source::{CGEventSource, CGEventSourceStateID},
+    geometry::CGPoint,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
@@ -37,6 +39,10 @@ extern "C" {
         key: *const c_void,
         value: *const c_void,
     ) -> i32;
+    fn CGEventSourceSetLocalEventsSuppressionInterval(
+        event_source: *mut c_void,
+        seconds: f64,
+    );
 }
 
 const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
@@ -101,6 +107,19 @@ enum UserEvent {
 fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
     let (rgba, sz) = hotswitch_proto::icon::make_icon_rgba(r, g, b, filled, 256);
     Icon::from_rgba(rgba, sz, sz).unwrap()
+}
+
+fn configure_cursor_capture() {
+    if let Ok(event_source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
+        unsafe {
+            CGEventSourceSetLocalEventsSuppressionInterval(
+                event_source.as_ref() as *const _ as *mut c_void,
+                0.05,
+            );
+        }
+    } else {
+        eprintln!("WARNING: Failed to create CGEventSource — cursor warp may feel sticky");
+    }
 }
 
 fn check_for_update() -> Option<String> {
@@ -551,6 +570,7 @@ fn main() {
     socket.set_nonblocking(true).ok();
 
     start_audio_playback();
+    configure_cursor_capture();
 
     unsafe {
         let conn = _CGSDefaultConnection();
@@ -569,6 +589,7 @@ fn main() {
         Arc::new(std::sync::Mutex::new(HashSet::new()));
     let accum_dx = Arc::new(std::sync::Mutex::new(0.0f64));
     let accum_dy = Arc::new(std::sync::Mutex::new(0.0f64));
+    let capture_anchor = Arc::new(std::sync::Mutex::new(None::<CGPoint>));
 
     // Tao event loop
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -600,6 +621,7 @@ fn main() {
     let keys = held_keys.clone();
     let adx = accum_dx.clone();
     let ady = accum_dy.clone();
+    let anchor = capture_anchor.clone();
     let tap_port: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(ptr::null_mut()));
     let tp = tap_port.clone();
     let proxy_tap = proxy.clone();
@@ -659,13 +681,17 @@ fn main() {
                     );
 
                     if now_capturing {
+                        let cursor_pos = cg_ev.location();
+                        *anchor.lock().unwrap() = Some(cursor_pos);
                         unsafe {
                             CGAssociateMouseAndMouseCursorPosition(false);
                         }
                         let _ = CGDisplay::hide_cursor(&CGDisplay::main());
+                        let _ = CGDisplay::warp_mouse_cursor_position(cursor_pos);
                         *adx.lock().unwrap() = 0.0;
                         *ady.lock().unwrap() = 0.0;
                     } else {
+                        *anchor.lock().unwrap() = None;
                         unsafe {
                             CGAssociateMouseAndMouseCursorPosition(true);
                         }
@@ -713,6 +739,9 @@ fn main() {
                     let evt = Event::MouseMove { dx, dy };
                     let len = evt.to_bytes(&mut buf);
                     let _ = sock.send(&buf[..len]);
+                    if let Some(anchor_pos) = *anchor.lock().unwrap() {
+                        let _ = CGDisplay::warp_mouse_cursor_position(anchor_pos);
+                    }
                 }
             }
 
@@ -983,6 +1012,7 @@ fn main() {
                 UserEvent::Menu(me) => {
                     if me.id == quit_id {
                         if capturing.load(Ordering::SeqCst) {
+                            *capture_anchor.lock().unwrap() = None;
                             unsafe {
                                 CGAssociateMouseAndMouseCursorPosition(true);
                             }
