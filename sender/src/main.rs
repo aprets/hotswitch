@@ -3,7 +3,8 @@ use core_graphics::{
     display::CGDisplay,
     event::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-        CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
+        CGEventTapPlacement, CGEventTapProxy, CGEventType, CGMouseButton, CallbackResult,
+        EventField,
     },
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
@@ -11,15 +12,29 @@ use core_graphics::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
 use hotswitch_proto::{audio, Event};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{
+    NSAlert, NSAlertFirstButtonReturn, NSTextField, NSWorkspace,
+    NSWorkspaceScreensDidSleepNotification, NSWorkspaceSessionDidResignActiveNotification,
+    NSWorkspaceWillSleepNotification,
+};
+use objc2_foundation::{
+    ns_string, NSActivityOptions, NSDistributedNotificationCenter, NSNotification,
+    NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize,
+};
 use std::{
     collections::HashSet,
     ffi::c_void,
+    net::SocketAddr,
     net::UdpSocket,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
+    time::SystemTime,
     time::{Duration, Instant},
 };
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -39,10 +54,7 @@ extern "C" {
         key: *const c_void,
         value: *const c_void,
     ) -> i32;
-    fn CGEventSourceSetLocalEventsSuppressionInterval(
-        event_source: *mut c_void,
-        seconds: f64,
-    );
+    fn CGEventSourceSetLocalEventsSuppressionInterval(event_source: *mut c_void, seconds: f64);
 }
 
 const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
@@ -52,9 +64,19 @@ const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNE
 const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 66; // ~15ms
 const AUDIO_BIAS_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 40; // ~25ms
 const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
+const AUDIO_SEQ_RESET_STALE_PACKETS: u32 = 16;
+const DEFAULT_RECEIVER_PLACEHOLDER: &str = "10.0.0.100:24801";
+const RECEIVER_ADDRESS_KEY: &str = "receiver-address.txt";
+const MACOS_RELEASE_ASSET: &str = "hotswitch-sender-aarch64-apple-darwin.tar.gz";
 
 fn seq_is_newer(seq: u32, last: u32) -> bool {
     (seq.wrapping_sub(last) as i32) > 0
+}
+
+fn drain_audio_queue(queue: &ArrayQueue<f32>, buf_fill: &AtomicU32, primed: &AtomicBool) {
+    while queue.pop().is_some() {}
+    buf_fill.store(0, Ordering::Relaxed);
+    primed.store(false, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,8 +122,95 @@ impl AppState {
 enum UserEvent {
     StateChanged,
     CaptureBlocked,
+    ReleaseCapture(&'static str),
     UpdateAvailable(String),
     Menu(tray_icon::menu::MenuEvent),
+}
+
+#[derive(Clone)]
+struct LifecycleObserverIvars {
+    proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = LifecycleObserverIvars]
+    struct LifecycleObserver;
+
+    unsafe impl NSObjectProtocol for LifecycleObserver {}
+
+    impl LifecycleObserver {
+        #[unsafe(method(handleNotification:))]
+        fn handle_notification(&self, _notification: &NSNotification) {
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(UserEvent::ReleaseCapture("macOS lifecycle"));
+        }
+    }
+);
+
+impl LifecycleObserver {
+    fn new(
+        mtm: MainThreadMarker,
+        proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(LifecycleObserverIvars { proxy });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn register(
+        &self,
+        workspace_center: &NSNotificationCenter,
+        distributed_center: &NSDistributedNotificationCenter,
+    ) {
+        unsafe {
+            workspace_center.addObserver_selector_name_object(
+                self,
+                sel!(handleNotification:),
+                Some(NSWorkspaceWillSleepNotification),
+                None,
+            );
+            workspace_center.addObserver_selector_name_object(
+                self,
+                sel!(handleNotification:),
+                Some(NSWorkspaceScreensDidSleepNotification),
+                None,
+            );
+            workspace_center.addObserver_selector_name_object(
+                self,
+                sel!(handleNotification:),
+                Some(NSWorkspaceSessionDidResignActiveNotification),
+                None,
+            );
+            distributed_center.addObserver_selector_name_object(
+                self,
+                sel!(handleNotification:),
+                Some(ns_string!("com.apple.screenIsLocked")),
+                None,
+            );
+            distributed_center.addObserver_selector_name_object(
+                self,
+                sel!(handleNotification:),
+                Some(ns_string!("com.apple.screensaver.didstart")),
+                None,
+            );
+        }
+    }
+}
+
+struct PowerActivity {
+    process_info: Retained<NSProcessInfo>,
+    activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+}
+
+impl PowerActivity {
+    fn stop(&self) {
+        unsafe {
+            self.process_info.endActivity(&self.activity);
+        }
+    }
 }
 
 fn make_icon(r: u8, g: u8, b: u8, filled: bool) -> Icon {
@@ -122,7 +231,92 @@ fn configure_cursor_capture() {
     }
 }
 
-fn check_for_update() -> Option<String> {
+fn start_sleep_prevention() -> PowerActivity {
+    let process_info = NSProcessInfo::processInfo();
+    let activity = process_info.beginActivityWithOptions_reason(
+        NSActivityOptions::IdleDisplaySleepDisabled | NSActivityOptions::IdleSystemSleepDisabled,
+        ns_string!("Hotswitch sender active"),
+    );
+    eprintln!("power: preventing idle display and system sleep while sender is running");
+    PowerActivity {
+        process_info,
+        activity,
+    }
+}
+
+fn disengage_capture(
+    reason: &str,
+    capturing: &AtomicBool,
+    capture_anchor: &Mutex<Option<CGPoint>>,
+    held_keys: &Mutex<HashSet<u16>>,
+    accum_dx: &Mutex<f64>,
+    accum_dy: &Mutex<f64>,
+    socket: &UdpSocket,
+) -> bool {
+    if !capturing.swap(false, Ordering::SeqCst) {
+        eprintln!("capture release skipped ({reason}): already not capturing");
+        return false;
+    }
+
+    let restore_pos = capture_anchor.lock().unwrap().take();
+    *accum_dx.lock().unwrap() = 0.0;
+    *accum_dy.lock().unwrap() = 0.0;
+
+    let held: Vec<u16> = held_keys.lock().unwrap().drain().collect();
+    eprintln!(
+        "capture stopped ({reason}): restore_pos={:?}, held_keys={}",
+        restore_pos,
+        held.len()
+    );
+
+    let associate_result = unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+    eprintln!("cursor restore ({reason}): associate result={associate_result}");
+
+    let show_result = CGDisplay::show_cursor(&CGDisplay::main());
+    eprintln!("cursor restore ({reason}): show result={show_result:?}");
+
+    if let Some(pos) = restore_pos {
+        if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
+            match CGEvent::new_mouse_event(
+                source,
+                CGEventType::MouseMoved,
+                pos,
+                CGMouseButton::Left,
+            ) {
+                Ok(event) => {
+                    event.post(CGEventTapLocation::Session);
+                    eprintln!("cursor restore ({reason}): posted mouse moved at {pos:?}");
+                }
+                Err(()) => {
+                    eprintln!("cursor restore ({reason}): failed to create mouse moved event");
+                }
+            }
+        } else {
+            eprintln!("cursor restore ({reason}): failed to create event source");
+        }
+    } else {
+        eprintln!("cursor restore ({reason}): no anchor to redraw at");
+    }
+
+    let mut buf = [0u8; 64];
+    for keycode in held {
+        let evt = Event::Key {
+            keycode,
+            pressed: false,
+        };
+        let len = evt.to_bytes(&mut buf);
+        let _ = socket.send(&buf[..len]);
+    }
+
+    true
+}
+
+enum UpdateOutcome {
+    AlreadyUpToDate,
+    UpdatedAndRelaunching,
+}
+
+fn latest_release_version() -> Option<String> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner("aprets")
         .repo_name("hotswitch")
@@ -130,17 +324,165 @@ fn check_for_update() -> Option<String> {
         .ok()?
         .fetch()
         .ok()?;
-    let latest = releases.first()?;
-    if self_update::version::bump_is_greater(self_update::cargo_crate_version!(), &latest.version)
+    Some(releases.first()?.version.clone())
+}
+
+fn check_for_update() -> Option<String> {
+    let latest = latest_release_version()?;
+    if self_update::version::bump_is_greater(self_update::cargo_crate_version!(), &latest)
         .unwrap_or(false)
     {
-        Some(latest.version.clone())
+        Some(latest)
     } else {
         None
     }
 }
 
-fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
+fn current_app_bundle_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let app_root = exe.parent()?.parent()?.parent()?;
+    if app_root.extension().and_then(|ext| ext.to_str()) == Some("app") {
+        Some(app_root.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn update_work_dir(version: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("hotswitch-update-{version}-{stamp}"))
+}
+
+fn run_command(command: &mut std::process::Command, description: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|err| format!("{description} failed to start: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status)
+    };
+    Err(format!("{description} failed: {detail}"))
+}
+
+fn write_update_helper(helper_path: &Path) -> Result<(), String> {
+    let script = "#!/bin/sh\nset -eu\npid=\"$1\"\napp_path=\"$2\"\nstaged_app=\"$3\"\nwork_dir=\"$4\"\nbackup_path=\"${app_path}.old\"\nwhile kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done\nrm -rf \"$backup_path\"\nmv \"$app_path\" \"$backup_path\"\nif mv \"$staged_app\" \"$app_path\"; then\n  rm -rf \"$backup_path\"\n  open \"$app_path\"\n  rm -rf \"$work_dir\"\n  rm -f \"$0\"\nelse\n  mv \"$backup_path\" \"$app_path\"\n  exit 1\nfi\n";
+    std::fs::write(helper_path, script)
+        .map_err(|err| format!("failed to write update helper: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(helper_path, perms)
+            .map_err(|err| format!("failed to chmod update helper: {err}"))?;
+    }
+    Ok(())
+}
+
+fn prepare_app_bundle_update(app_root: &Path) -> Result<UpdateOutcome, String> {
+    let version = match check_for_update() {
+        Some(version) => version,
+        None => return Ok(UpdateOutcome::AlreadyUpToDate),
+    };
+
+    let app_parent = app_root
+        .parent()
+        .ok_or_else(|| format!("app bundle path has no parent: {}", app_root.display()))?;
+    let write_probe = app_parent.join(format!(".hotswitch-write-test-{}", std::process::id()));
+    std::fs::write(&write_probe, b"").map_err(|err| {
+        format!(
+            "cannot update {}: parent directory is not writable ({err})",
+            app_root.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&write_probe);
+
+    let work_dir = update_work_dir(&version);
+    std::fs::create_dir_all(&work_dir).map_err(|err| {
+        format!(
+            "failed to create update workspace {}: {err}",
+            work_dir.display()
+        )
+    })?;
+    let archive_path = work_dir.join(MACOS_RELEASE_ASSET);
+    let staged_app = work_dir.join("Hotswitch.app");
+    let helper_path =
+        std::env::temp_dir().join(format!("hotswitch-update-helper-{}.sh", std::process::id()));
+    let download_url = format!(
+        "https://github.com/aprets/hotswitch/releases/download/v{version}/{MACOS_RELEASE_ASSET}"
+    );
+
+    run_command(
+        std::process::Command::new("curl").args([
+            "-L",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "-o",
+            archive_path.to_str().ok_or("invalid archive path")?,
+            &download_url,
+        ]),
+        "download update",
+    )?;
+
+    run_command(
+        std::process::Command::new("tar").args([
+            "-xzf",
+            archive_path.to_str().ok_or("invalid archive path")?,
+            "-C",
+            work_dir.to_str().ok_or("invalid workspace path")?,
+        ]),
+        "extract update archive",
+    )?;
+
+    if !staged_app.is_dir() {
+        return Err(format!(
+            "update archive did not contain {}",
+            staged_app.display()
+        ));
+    }
+
+    run_command(
+        std::process::Command::new("codesign").args([
+            "--verify",
+            "--deep",
+            "--strict",
+            staged_app.to_str().ok_or("invalid staged app path")?,
+        ]),
+        "verify app signature",
+    )?;
+
+    write_update_helper(&helper_path)?;
+
+    std::process::Command::new("/bin/sh")
+        .arg(&helper_path)
+        .arg(std::process::id().to_string())
+        .arg(app_root)
+        .arg(&staged_app)
+        .arg(&work_dir)
+        .spawn()
+        .map_err(|err| format!("failed to launch update helper: {err}"))?;
+
+    Ok(UpdateOutcome::UpdatedAndRelaunching)
+}
+
+fn apply_update() -> Result<UpdateOutcome, Box<dyn std::error::Error>> {
+    if let Some(app_root) = current_app_bundle_path() {
+        return prepare_app_bundle_update(&app_root)
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() });
+    }
+
     let status = self_update::backends::github::Update::configure()
         .repo_owner("aprets")
         .repo_name("hotswitch")
@@ -151,7 +493,11 @@ fn apply_update() -> Result<self_update::Status, Box<dyn std::error::Error>> {
         .show_output(false)
         .build()?
         .update()?;
-    Ok(status)
+    if status.updated() {
+        Ok(UpdateOutcome::UpdatedAndRelaunching)
+    } else {
+        Ok(UpdateOutcome::AlreadyUpToDate)
+    }
 }
 
 fn map_mouse_button(event_type: &CGEventType, ev: &CGEvent) -> Option<(u8, bool)> {
@@ -173,6 +519,127 @@ fn map_mouse_button(event_type: &CGEventType, ev: &CGEvent) -> Option<(u8, bool)
         }
         _ => None,
     }
+}
+
+fn app_support_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join("Library/Application Support")
+        .join("Hotswitch")
+}
+
+fn receiver_address_path() -> PathBuf {
+    app_support_dir().join(RECEIVER_ADDRESS_KEY)
+}
+
+fn parse_receiver_address(value: &str) -> Result<String, &'static str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Enter the Windows receiver address in IP:port form.");
+    }
+
+    trimmed
+        .parse::<SocketAddr>()
+        .map(|addr| addr.to_string())
+        .map_err(|_| "Use a valid receiver address like 10.0.0.209:24801.")
+}
+
+fn load_receiver_address() -> Option<String> {
+    let path = receiver_address_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    match parse_receiver_address(&raw) {
+        Ok(addr) => Some(addr),
+        Err(err) => {
+            eprintln!(
+                "ignoring invalid receiver address at {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn save_receiver_address(target_addr: &str) -> bool {
+    let path = receiver_address_path();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "failed to create receiver address directory {}: {err}",
+                parent.display()
+            );
+            return false;
+        }
+    }
+
+    match std::fs::write(&path, format!("{target_addr}\n")) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "failed to save receiver address to {}: {err}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+fn prompt_for_receiver_address(current_value: Option<&str>) -> Option<String> {
+    let mtm = MainThreadMarker::new().expect("sender must prompt on the main thread");
+    let mut next_value = current_value.unwrap_or_default().to_string();
+    let mut error_message = None::<&'static str>;
+
+    loop {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(ns_string!("Receiver Address"));
+        let info = match error_message {
+            Some(message) => message,
+            None => "Enter the Windows receiver address in IP:port form.",
+        };
+        let informative_text = format!("{info}\n\nExample: {DEFAULT_RECEIVER_PLACEHOLDER}");
+        let informative = objc2_foundation::NSString::from_str(&informative_text);
+        alert.setInformativeText(&informative);
+        alert.addButtonWithTitle(ns_string!("Save"));
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 24.0));
+        let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), frame);
+        field.setPlaceholderString(Some(ns_string!(DEFAULT_RECEIVER_PLACEHOLDER)));
+        let value = objc2_foundation::NSString::from_str(&next_value);
+        field.setStringValue(&value);
+        alert.setAccessoryView(Some(field.as_ref()));
+
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return None;
+        }
+
+        next_value = field.stringValue().to_string();
+        match parse_receiver_address(&next_value) {
+            Ok(addr) => return Some(addr),
+            Err(message) => error_message = Some(message),
+        }
+    }
+}
+
+fn resolve_receiver_address() -> Option<String> {
+    if let Some(arg_addr) = std::env::args().nth(1) {
+        match parse_receiver_address(&arg_addr) {
+            Ok(addr) => {
+                let _ = save_receiver_address(&addr);
+                return Some(addr);
+            }
+            Err(err) => eprintln!("ignoring invalid receiver address argument: {err}"),
+        }
+    }
+
+    if let Some(saved_addr) = load_receiver_address() {
+        return Some(saved_addr);
+    }
+
+    let addr = prompt_for_receiver_address(None)?;
+    if !save_receiver_address(&addr) {
+        eprintln!("receiver address prompt succeeded but saving failed");
+    }
+    Some(addr)
 }
 
 // --- Log file ---
@@ -223,7 +690,7 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn set_login_item(enabled: bool, target_addr: &str) -> bool {
+fn set_login_item(enabled: bool) -> bool {
     let path = launch_agent_path();
     eprintln!("set_login_item: enabled={enabled}, path={}", path.display());
     if enabled {
@@ -235,7 +702,6 @@ fn set_login_item(enabled: bool, target_addr: &str) -> bool {
             }
         };
         let exe_escaped = xml_escape(&exe.display().to_string());
-        let addr_escaped = xml_escape(target_addr);
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -246,7 +712,6 @@ fn set_login_item(enabled: bool, target_addr: &str) -> bool {
     <key>ProgramArguments</key>
     <array>
         <string>{exe_escaped}</string>
-        <string>{addr_escaped}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -480,6 +945,7 @@ fn start_audio_playback() {
 
         let mut buf = [0u8; 1500];
         let mut last_seq = None;
+        let mut stale_seq_run = 0u32;
         loop {
             if last_device_poll.elapsed() >= Duration::from_secs(2) {
                 last_device_poll = Instant::now();
@@ -529,8 +995,19 @@ fn start_audio_playback() {
             if let Some((seq, _channels, raw)) = audio::audio_from_bytes(&buf[..n]) {
                 if let Some(prev) = last_seq {
                     if !seq_is_newer(seq, prev) {
-                        stale_packets.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                        stale_seq_run = stale_seq_run.saturating_add(1);
+                        if stale_seq_run >= AUDIO_SEQ_RESET_STALE_PACKETS {
+                            eprintln!(
+                                "audio: sequence reset detected after {stale_seq_run} stale packets ({prev} -> {seq})"
+                            );
+                            stale_seq_run = 0;
+                            drain_audio_queue(&queue, &buf_fill, &primed);
+                        } else {
+                            stale_packets.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    } else {
+                        stale_seq_run = 0;
                     }
                 }
                 last_seq = Some(seq);
@@ -557,9 +1034,14 @@ fn start_audio_playback() {
 fn main() {
     let log_file_path = redirect_stdio_to_log();
 
-    let target_addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "10.0.0.100:24801".to_string());
+    let target_addr = match resolve_receiver_address() {
+        Some(addr) => addr,
+        None => return,
+    };
+
+    if is_login_item() {
+        let _ = set_login_item(true);
+    }
 
     eprintln!("hotswitch sender starting, target: {target_addr}");
 
@@ -571,6 +1053,7 @@ fn main() {
 
     start_audio_playback();
     configure_cursor_capture();
+    let power_activity = start_sleep_prevention();
 
     unsafe {
         let conn = _CGSDefaultConnection();
@@ -595,6 +1078,13 @@ fn main() {
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
     let proxy = event_loop.create_proxy();
+    let mtm = MainThreadMarker::new().expect("sender must start on the main thread");
+
+    let workspace = NSWorkspace::sharedWorkspace();
+    let workspace_center = workspace.notificationCenter();
+    let distributed_center = NSDistributedNotificationCenter::defaultCenter();
+    let lifecycle_observer = LifecycleObserver::new(mtm, proxy.clone());
+    lifecycle_observer.register(&workspace_center, &distributed_center);
 
     // Helper to recompute and store combined AppState
     let compute_state = {
@@ -674,38 +1164,31 @@ fn main() {
                         return CallbackResult::Drop;
                     }
                     let now_capturing = !was_capturing;
-                    cap.store(now_capturing, Ordering::SeqCst);
-                    eprintln!(
-                        "capture {}",
-                        if now_capturing { "started" } else { "stopped" }
-                    );
 
                     if now_capturing {
+                        cap.store(true, Ordering::SeqCst);
                         let cursor_pos = cg_ev.location();
+                        eprintln!("capture started: anchor={cursor_pos:?}");
                         *anchor.lock().unwrap() = Some(cursor_pos);
-                        unsafe {
-                            CGAssociateMouseAndMouseCursorPosition(false);
-                        }
-                        let _ = CGDisplay::hide_cursor(&CGDisplay::main());
-                        let _ = CGDisplay::warp_mouse_cursor_position(cursor_pos);
+                        let associate_result =
+                            unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
+                        eprintln!("cursor capture: associate result={associate_result}");
+                        let hide_result = CGDisplay::hide_cursor(&CGDisplay::main());
+                        eprintln!("cursor capture: hide result={hide_result:?}");
+                        let warp_result = CGDisplay::warp_mouse_cursor_position(cursor_pos);
+                        eprintln!("cursor capture: warp result={warp_result:?}");
                         *adx.lock().unwrap() = 0.0;
                         *ady.lock().unwrap() = 0.0;
                     } else {
-                        *anchor.lock().unwrap() = None;
-                        unsafe {
-                            CGAssociateMouseAndMouseCursorPosition(true);
-                        }
-                        let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                        let held: Vec<u16> = keys.lock().unwrap().drain().collect();
-                        let mut buf = [0u8; 64];
-                        for keycode in held {
-                            let evt = Event::Key {
-                                keycode,
-                                pressed: false,
-                            };
-                            let len = evt.to_bytes(&mut buf);
-                            let _ = sock.send(&buf[..len]);
-                        }
+                        let _ = disengage_capture(
+                            "hotkey",
+                            cap.as_ref(),
+                            anchor.as_ref(),
+                            keys.as_ref(),
+                            adx.as_ref(),
+                            ady.as_ref(),
+                            &sock,
+                        );
                     }
                     compute_tap();
                     let _ = proxy_tap.send_event(UserEvent::StateChanged);
@@ -919,6 +1402,7 @@ fn main() {
 
     let menu = Menu::new();
     let status_item = MenuItem::new(AppState::Waiting.status_text(), false, None);
+    let address_item = MenuItem::new("Receiver Address...", true, None);
     let log_item = MenuItem::new("Show Log", true, None);
     let login_item = CheckMenuItem::new("Start on Login", true, is_login_item(), None);
     let quit_item = MenuItem::new("Quit", true, None);
@@ -926,6 +1410,7 @@ fn main() {
         &status_item,
         &PredefinedMenuItem::separator(),
         &update_item,
+        &address_item,
         &log_item,
         &login_item,
         &PredefinedMenuItem::separator(),
@@ -948,11 +1433,14 @@ fn main() {
         .expect("Failed to create tray icon");
 
     let update_id = update_item.id().clone();
+    let address_id = address_item.id().clone();
     let log_id = log_item.id().clone();
     let login_id = login_item.id().clone();
     let quit_id = quit_item.id().clone();
-    let addr_for_login = target_addr.clone();
     let mut login_checked = is_login_item();
+    let mut configured_target_addr = target_addr.clone();
+    let _lifecycle_guard = (workspace_center, distributed_center, lifecycle_observer);
+    let mut power_activity = Some(power_activity);
 
     let mut last_state = initial_state;
     let mut flash_until: Option<Instant> = None;
@@ -1009,14 +1497,39 @@ fn main() {
                     flash_until = Some(deadline);
                     *control_flow = ControlFlow::WaitUntil(deadline);
                 }
+                UserEvent::ReleaseCapture(reason) => {
+                    if disengage_capture(
+                        reason,
+                        capturing.as_ref(),
+                        capture_anchor.as_ref(),
+                        held_keys.as_ref(),
+                        accum_dx.as_ref(),
+                        accum_dy.as_ref(),
+                        &socket,
+                    ) {
+                        let new_state = compute_state();
+                        if new_state != last_state {
+                            let (icon, tmpl) = new_state.icon();
+                            let _ = tray.set_icon_with_as_template(Some(icon), tmpl);
+                            let _ = tray.set_tooltip(Some(new_state.tooltip()));
+                            status_item.set_text(new_state.status_text());
+                            last_state = new_state;
+                        }
+                    }
+                }
                 UserEvent::Menu(me) => {
                     if me.id == quit_id {
-                        if capturing.load(Ordering::SeqCst) {
-                            *capture_anchor.lock().unwrap() = None;
-                            unsafe {
-                                CGAssociateMouseAndMouseCursorPosition(true);
-                            }
-                            let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                        let _ = disengage_capture(
+                            "quit",
+                            capturing.as_ref(),
+                            capture_anchor.as_ref(),
+                            held_keys.as_ref(),
+                            accum_dx.as_ref(),
+                            accum_dy.as_ref(),
+                            &socket,
+                        );
+                        if let Some(activity) = power_activity.take() {
+                            activity.stop();
                         }
                         *control_flow = ControlFlow::Exit;
                     } else if me.id == update_id {
@@ -1024,24 +1537,28 @@ fn main() {
                         update_item.set_text("Updating...");
                         update_item.set_enabled(false);
                         match apply_update() {
-                            Ok(status) => {
-                                eprintln!("update result: {status}");
-                                if status.updated() {
-                                    let args: Vec<String> = std::env::args().skip(1).collect();
-                                    eprintln!("relaunching: {exe:?} {args:?}");
-                                    match std::process::Command::new(&exe).args(&args).spawn() {
-                                        Ok(_) => {}
-                                        Err(e) => eprintln!("relaunch failed: {e}"),
+                            Ok(outcome) => match outcome {
+                                UpdateOutcome::UpdatedAndRelaunching => {
+                                    eprintln!("relaunching: {exe:?}");
+                                    if current_app_bundle_path().is_none() {
+                                        match std::process::Command::new(&exe).spawn() {
+                                            Ok(_) => {}
+                                            Err(e) => eprintln!("relaunch failed: {e}"),
+                                        }
+                                    }
+                                    if let Some(activity) = power_activity.take() {
+                                        activity.stop();
                                     }
                                     *control_flow = ControlFlow::Exit;
                                     return;
-                                } else {
+                                }
+                                UpdateOutcome::AlreadyUpToDate => {
                                     update_item.set_text("Already up to date");
                                     let deadline = Instant::now() + Duration::from_secs(5);
                                     reset_update_at = Some(deadline);
                                     *control_flow = ControlFlow::WaitUntil(deadline);
                                 }
-                            }
+                            },
                             Err(e) => {
                                 eprintln!("update failed: {e}");
                                 update_item.set_text("Update failed");
@@ -1056,8 +1573,44 @@ fn main() {
                             .arg("-t")
                             .arg(&log_file_path)
                             .spawn();
+                    } else if me.id == address_id {
+                        if let Some(new_addr) =
+                            prompt_for_receiver_address(Some(&configured_target_addr))
+                        {
+                            if new_addr != configured_target_addr
+                                && save_receiver_address(&new_addr)
+                            {
+                                configured_target_addr = new_addr;
+                                if login_checked {
+                                    let _ = set_login_item(true);
+                                }
+                                let _ = disengage_capture(
+                                    "receiver address changed",
+                                    capturing.as_ref(),
+                                    capture_anchor.as_ref(),
+                                    held_keys.as_ref(),
+                                    accum_dx.as_ref(),
+                                    accum_dy.as_ref(),
+                                    &socket,
+                                );
+                                if let Some(activity) = power_activity.take() {
+                                    activity.stop();
+                                }
+                                match std::process::Command::new(
+                                    std::env::current_exe()
+                                        .expect("Failed to get current exe path"),
+                                )
+                                .spawn()
+                                {
+                                    Ok(_) => *control_flow = ControlFlow::Exit,
+                                    Err(err) => {
+                                        eprintln!("relaunch after address change failed: {err}")
+                                    }
+                                }
+                            }
+                        }
                     } else if me.id == login_id {
-                        if set_login_item(!login_checked, &addr_for_login) {
+                        if set_login_item(!login_checked) {
                             login_checked = !login_checked;
                             login_item.set_checked(login_checked);
                         }
