@@ -127,6 +127,28 @@ enum UserEvent {
     Menu(tray_icon::menu::MenuEvent),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum HookKind {
+    ReceiverConnected,
+    ReceiverDisconnected,
+}
+
+impl HookKind {
+    fn filename(self) -> &'static str {
+        match self {
+            Self::ReceiverConnected => "on-receiver-connected",
+            Self::ReceiverDisconnected => "on-receiver-disconnected",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ReceiverConnected => "receiver-connected",
+            Self::ReceiverDisconnected => "receiver-disconnected",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LifecycleObserverIvars {
     proxy: tao::event_loop::EventLoopProxy<UserEvent>,
@@ -640,6 +662,61 @@ fn resolve_receiver_address() -> Option<String> {
         eprintln!("receiver address prompt succeeded but saving failed");
     }
     Some(addr)
+}
+
+// --- Hooks ---
+
+fn hooks_dir() -> PathBuf {
+    app_support_dir().join("hooks")
+}
+
+fn hook_path(kind: HookKind) -> PathBuf {
+    hooks_dir().join(kind.filename())
+}
+
+fn run_hook(kind: HookKind, wait: bool) {
+    let path = hook_path(kind);
+    let label = kind.label();
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("hook {label}: no script at {}", path.display());
+            return;
+        }
+        Err(e) => {
+            eprintln!("hook {label}: failed to inspect {}: {e}", path.display());
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            eprintln!("hook {label}: script is not executable: {}", path.display());
+            return;
+        }
+    }
+
+    let run = move || {
+        let start = Instant::now();
+        eprintln!("hook {label}: running {}", path.display());
+        match std::process::Command::new(&path).status() {
+            Ok(status) => {
+                eprintln!(
+                    "hook {label}: exited {status} in {}ms",
+                    start.elapsed().as_millis()
+                );
+            }
+            Err(e) => eprintln!("hook {label}: failed to run {}: {e}", path.display()),
+        }
+    };
+
+    if wait {
+        run();
+    } else {
+        thread::spawn(run);
+    }
 }
 
 // --- Log file ---
@@ -1443,6 +1520,7 @@ fn main() {
     let mut power_activity = Some(power_activity);
 
     let mut last_state = initial_state;
+    let mut receiver_hook_active = false;
     let mut flash_until: Option<Instant> = None;
     let mut reset_update_at: Option<Instant> = None;
 
@@ -1472,10 +1550,26 @@ fn main() {
             }
         }
 
+        if let tao::event::Event::LoopDestroyed = &event {
+            if receiver_hook_active {
+                receiver_hook_active = false;
+                run_hook(HookKind::ReceiverDisconnected, true);
+            }
+        }
+
         if let tao::event::Event::UserEvent(ue) = &event {
             match ue {
                 UserEvent::StateChanged => {
                     let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
+                    let receiver_is_connected = receiver_connected.load(Ordering::SeqCst);
+                    if receiver_is_connected && !receiver_hook_active {
+                        receiver_hook_active = true;
+                        run_hook(HookKind::ReceiverConnected, false);
+                    } else if !receiver_is_connected && receiver_hook_active {
+                        receiver_hook_active = false;
+                        run_hook(HookKind::ReceiverDisconnected, false);
+                    }
+
                     if new_state != last_state {
                         if flash_until.is_none() {
                             let (icon, tmpl) = new_state.icon();
@@ -1531,6 +1625,10 @@ fn main() {
                         if let Some(activity) = power_activity.take() {
                             activity.stop();
                         }
+                        if receiver_hook_active {
+                            receiver_hook_active = false;
+                            run_hook(HookKind::ReceiverDisconnected, true);
+                        }
                         *control_flow = ControlFlow::Exit;
                     } else if me.id == update_id {
                         let exe = std::env::current_exe().expect("Failed to get current exe path");
@@ -1548,6 +1646,10 @@ fn main() {
                                     }
                                     if let Some(activity) = power_activity.take() {
                                         activity.stop();
+                                    }
+                                    if receiver_hook_active {
+                                        receiver_hook_active = false;
+                                        run_hook(HookKind::ReceiverDisconnected, true);
                                     }
                                     *control_flow = ControlFlow::Exit;
                                     return;
@@ -1595,6 +1697,10 @@ fn main() {
                                 );
                                 if let Some(activity) = power_activity.take() {
                                     activity.stop();
+                                }
+                                if receiver_hook_active {
+                                    receiver_hook_active = false;
+                                    run_hook(HookKind::ReceiverDisconnected, true);
                                 }
                                 match std::process::Command::new(
                                     std::env::current_exe()

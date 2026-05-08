@@ -73,6 +73,19 @@ hotswitch-receiver.exe 0.0.0.0:24801
 - Start on Login
 - Quit
 
+### macOS hooks
+
+The sender runs optional executable hook scripts from:
+
+```text
+~/Library/Application Support/Hotswitch/hooks/
+```
+
+- `on-receiver-connected`: runs when the sender first sees the receiver.
+- `on-receiver-disconnected`: runs when the receiver disappears, the sender quits, or the sender relaunches for an update/address change after having connected.
+
+Hooks run asynchronously during normal connection changes and are logged in `~/Library/Logs/hotswitch-sender.log`. Quit and relaunch cleanup waits for the disconnect hook to finish.
+
 ### Windows receiver
 
 - Status line
