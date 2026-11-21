@@ -2,7 +2,8 @@
 
 use core_graphics::event::CGEventFlags;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use tray_icon::menu::accelerator::{Accelerator, Code, Modifiers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,7 +192,7 @@ const KEYS: &[(u16, &str, Code)] = &[
 pub struct Settings {
     /// Windows receiver, `IP:port`.
     pub receiver: Option<String>,
-    /// DDC monitor for PS5 mode: EDID serial or name. The first external monitor when unset.
+    /// The PS5 monitor's serial. Unset works only while exactly one monitor can be used.
     pub monitor: Option<String>,
     /// VCP 0x60 value of the PS5's input (0x11 is HDMI 1).
     pub ps5_input: u16,
@@ -199,8 +200,6 @@ pub struct Settings {
     pub audio_input: String,
     /// Shortcut per mode, indexed like `Mode::ALL`.
     pub hotkeys: [Option<Hotkey>; 3],
-    /// The input the monitor had before PS5 mode took it, kept until it is handed back.
-    pub restore_input: Option<u16>,
 }
 
 impl Default for Settings {
@@ -222,7 +221,6 @@ impl Default for Settings {
                 Some(ctrl(KEY_ESCAPE, false)),
                 Some(ctrl(KEY_ESCAPE, true)),
             ],
-            restore_input: None,
         }
     }
 }
@@ -243,7 +241,7 @@ impl Settings {
         (mode == Mode::Ps5).then_some(self.ps5_input)
     }
 
-    pub fn load(dir: &PathBuf) -> Self {
+    pub fn load(dir: &Path) -> Self {
         let path = dir.join("settings.json");
         match std::fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
@@ -263,18 +261,31 @@ impl Settings {
         }
     }
 
-    pub fn save(&self, dir: &PathBuf) {
-        let path = dir.join("settings.json");
-        let result = std::fs::create_dir_all(dir).and_then(|_| {
-            std::fs::write(
-                &path,
-                serde_json::to_string_pretty(self).unwrap_or_default(),
-            )
-        });
-        if let Err(e) = result {
-            eprintln!("settings: failed to save {}: {e}", path.display());
-        }
+    pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        write_atomically(&dir.join("settings.json"), &json)
     }
+}
+
+/// `~/Library/Application Support/Hotswitch`.
+pub fn support_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join("Library/Application Support")
+        .join("Hotswitch")
+}
+
+/// Replace `path` in one step: write a temporary file next to it, flush it to disk, rename.
+/// A crash leaves either the old file or the new one, never a truncated one.
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 pub fn parse_receiver_address(value: &str) -> Result<String, &'static str> {
@@ -317,6 +328,24 @@ mod tests {
         assert!(key(0x60, false).is_usable()); // F5
         assert!(key(0x23, true).is_usable()); // ⌃P
         assert!(key(0x23, true).accelerator().is_some());
+    }
+
+    #[test]
+    fn atomic_write_replaces_whole_file() {
+        let dir = std::env::temp_dir().join(format!("hotswitch-test-{}", std::process::id()));
+        let path = dir.join("x.json");
+        write_atomically(&path, b"first, longer").unwrap();
+        write_atomically(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(!path.with_extension("tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_settings_files_still_load() {
+        let old: Settings =
+            serde_json::from_str(r#"{"receiver":"10.0.0.209:24801","restore_input":15}"#).unwrap();
+        assert_eq!(old.receiver.as_deref(), Some("10.0.0.209:24801"));
     }
 
     #[test]

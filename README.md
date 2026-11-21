@@ -91,11 +91,21 @@ The PS5 plugs into the monitor over HDMI. The monitor's 3.5 mm audio out goes in
 
 1. starts a low-latency loop from that input to the default output (two HAL units and a small lock-free ring, 64-frame buffers, +6 dB with a soft limiter, about 13 ms on top of the output device's own latency);
 2. asks for microphone access first if macOS hasn't decided yet, so the prompt shows before the screen goes away;
-3. reads the monitor's current input over DDC/CI, then switches it to the PS5's input.
+3. reads the monitor's current input over DDC/CI. If that read fails, the monitor is not switched. Otherwise it saves a hand-back record and only then switches the monitor to the PS5's input.
 
-Leaving PS5 mode stops the loop and switches the monitor back to the input it had, unless something else has moved it on since. The loop follows the default output, and rebinds both its input and output after audio devices come and go (for example a dock that reboots), once they settle for a second.
+Leaving PS5 mode stops the loop and hands the monitor back: it reads the input again and restores the saved one only if the monitor still shows the PS5's. If the read fails, the monitor is left alone and the hand-back stays owed. The record (`monitor-claim.json`) keeps the monitor and both inputs as they were at entry, so Settings edits don't change it. It survives a crash, sleep or an unplugged dock and is retried on wake, when displays come back and at the next launch. Quitting waits for it, up to six seconds. Sleep ends PS5 mode; a locked or sleeping screen doesn't.
 
-DDC is kept gentle: monitors are found from the IORegistry only, the monitor that shows the Mac's main display is never touched, a read is at most two tries with a pause, a write is sent once, DDC jobs are at least a second apart, and nothing polls the monitor. `hotswitch-sender ddc` lists the monitors it may use; `ddc get <vcp> [monitor]` and `ddc set <vcp> <value> [monitor]` are there for debugging and hooks.
+The loop follows the default output. It rebinds both its input and output after audio devices come and go (for example a dock that reboots), once they settle for a second, and restarts if its input stops delivering.
+
+DDC rules:
+
+- Monitors are found from the IORegistry only, with no EDID or I2C traffic.
+- A monitor that could be showing the Mac's main display is never touched. If the main display can't be identified, no monitor is.
+- A monitor is targeted only by a serial number no other monitor shares. Without a saved choice, PS5 mode uses the only usable monitor and refuses when there are several.
+- Before every I2C transaction the display layout is checked again; any change stops the operation.
+- A read is at most two tries, 250 ms apart. A write is sent once. Operations are at least a second apart, queued switches collapse into the latest, and one lock file serializes DDC across the app, the CLI and hooks. Nothing polls the monitor.
+
+`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc get <vcp> [serial]` and `ddc set <vcp> <value> [serial]` follow the same rules. `HOTSWITCH_DDC_DRY_RUN=1` keeps every rule but simulates the monitors' inputs instead of sending I2C, which is useful for trying modes and hand-back without touching hardware.
 
 ### macOS hooks
 
@@ -140,7 +150,7 @@ cargo build --release -p hotswitch-receiver-service
 cargo test -p hotswitch-proto
 ```
 
-`build-sender-app.sh` signs the bundle with hardened runtime and `sender/macos/Hotswitch.entitlements` (audio input), using `$HOTSWITCH_SIGN_IDENTITY` or else the first "Apple Development" identity in the keychain. A stable signature keeps the Accessibility and Microphone permissions across rebuilds. An Apple Development certificate is only good on your own Macs; giving the app to anyone else needs a Developer ID certificate and notarization. Release builds in CI are still signed afterwards with the self-signed "Hotswitch" certificate.
+`build-sender-app.sh` signs the bundle with hardened runtime and `sender/macos/Hotswitch.entitlements` (audio input), using `$HOTSWITCH_SIGN_IDENTITY` or else the first "Apple Development" identity in the keychain. A stable signature keeps the Accessibility and Microphone permissions across rebuilds. An Apple Development certificate is only good on your own Macs; giving the app to anyone else needs a Developer ID certificate and notarization. CI signs releases with the self-signed "Hotswitch" certificate, also with hardened runtime and the same entitlements.
 
 ## Releasing
 

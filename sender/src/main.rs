@@ -1,4 +1,5 @@
 mod ddc;
+mod monitor;
 mod passthrough;
 mod settings;
 mod settings_window;
@@ -20,12 +21,14 @@ use core_graphics::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
 use hotswitch_proto::{audio, Event};
+use monitor::{Job, Report, Want};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSWorkspace, NSWorkspaceScreensDidSleepNotification,
-    NSWorkspaceSessionDidResignActiveNotification, NSWorkspaceWillSleepNotification,
+    NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidSleepNotification,
+    NSWorkspaceScreensDidWakeNotification, NSWorkspaceSessionDidResignActiveNotification,
+    NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
     ns_string, NSActivityOptions, NSDistributedNotificationCenter, NSNotification,
@@ -85,10 +88,14 @@ const AUDIO_SEQ_RESET_STALE_PACKETS: u32 = 16;
 const MACOS_RELEASE_ASSET: &str = "hotswitch-sender-aarch64-apple-darwin.tar.gz";
 /// Device changes come in bursts (a dock rebooting); act once they settle.
 const AUDIO_SETTLE: Duration = Duration::from_secs(1);
-/// Least time between two DDC jobs. Monitors behind a dock can drop off when pushed.
-const DDC_SPACING: Duration = Duration::from_secs(1);
-/// Pause between reading a monitor's input and writing a new one.
-const DDC_STEP: Duration = Duration::from_millis(100);
+/// Displays reconnecting or the Mac waking come in bursts too; an owed hand-back waits this long.
+const DISPLAY_SETTLE: Duration = Duration::from_secs(2);
+/// Retry a passthrough that failed to start (no DDC involved).
+const PASSTHROUGH_RETRY: Duration = Duration::from_secs(5);
+/// Restart a passthrough whose input has delivered nothing for this long.
+const PASSTHROUGH_STALL: Duration = Duration::from_secs(2);
+/// How long quitting waits for an owed hand-back.
+const HAND_BACK_WAIT: Duration = Duration::from_secs(6);
 
 fn seq_is_newer(seq: u32, last: u32) -> bool {
     (seq.wrapping_sub(last) as i32) > 0
@@ -117,7 +124,11 @@ enum UserEvent {
     /// A mode's shortcut, from the event tap.
     Hotkey(Mode),
     HotkeyRecorded(Mode, Recorded),
-    Monitor(MonitorResult),
+    Monitor(Report),
+    /// The Mac is about to sleep.
+    WillSleep,
+    /// The Mac or its screens woke, or displays were reconfigured.
+    DisplaysChanged,
     Settings(Action),
     /// Audio devices came or went, or the default output changed.
     AudioDevicesChanged,
@@ -176,6 +187,18 @@ define_class!(
                 .proxy
                 .send_event(UserEvent::ReleaseCapture("macOS lifecycle"));
         }
+
+        #[unsafe(method(handleSleep:))]
+        fn handle_sleep(&self, _notification: &NSNotification) {
+            let proxy = &self.ivars().proxy;
+            let _ = proxy.send_event(UserEvent::ReleaseCapture("macOS lifecycle"));
+            let _ = proxy.send_event(UserEvent::WillSleep);
+        }
+
+        #[unsafe(method(handleWake:))]
+        fn handle_wake(&self, _notification: &NSNotification) {
+            let _ = self.ivars().proxy.send_event(UserEvent::DisplaysChanged);
+        }
     }
 );
 
@@ -196,10 +219,21 @@ impl LifecycleObserver {
         unsafe {
             workspace_center.addObserver_selector_name_object(
                 self,
-                sel!(handleNotification:),
+                sel!(handleSleep:),
                 Some(NSWorkspaceWillSleepNotification),
                 None,
             );
+            for wake in [
+                NSWorkspaceDidWakeNotification,
+                NSWorkspaceScreensDidWakeNotification,
+            ] {
+                workspace_center.addObserver_selector_name_object(
+                    self,
+                    sel!(handleWake:),
+                    Some(wake),
+                    None,
+                );
+            }
             workspace_center.addObserver_selector_name_object(
                 self,
                 sel!(handleNotification:),
@@ -578,10 +612,7 @@ fn map_mouse_button(event_type: &CGEventType, ev: &CGEvent) -> Option<(u8, bool)
 }
 
 fn app_support_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join("Library/Application Support")
-        .join("Hotswitch")
+    settings::support_dir()
 }
 
 // --- Hooks ---
@@ -1033,133 +1064,6 @@ fn start_audio_playback() {
     });
 }
 
-// --- Monitor input over DDC (on its own thread: reads and writes sleep) ---
-
-#[derive(Debug)]
-enum MonitorResult {
-    Took {
-        name: String,
-        input: u16,
-        previous: Option<u16>,
-    },
-    Returned {
-        name: String,
-        input: u16,
-    },
-    Failed(String),
-}
-
-enum MonitorJob {
-    /// Show `input`, remembering what the monitor showed before.
-    Take { monitor: Option<String>, input: u16 },
-    /// Hand the monitor back if it still shows `from`. `fallback` is the saved input, for
-    /// when this run did not take it (after a crash).
-    Return {
-        monitor: Option<String>,
-        from: u16,
-        fallback: Option<u16>,
-        done: Option<mpsc::Sender<bool>>,
-    },
-}
-
-fn spawn_monitor_worker(proxy: EventLoopProxy<UserEvent>) -> mpsc::Sender<MonitorJob> {
-    let (tx, rx) = mpsc::channel::<MonitorJob>();
-    thread::spawn(move || {
-        let mut previous: Option<u16> = None;
-        let mut last = Instant::now()
-            .checked_sub(DDC_SPACING)
-            .unwrap_or_else(Instant::now);
-        while let Ok(mut job) = rx.recv() {
-            // Space DDC traffic out, and when switches pile up, act only on the latest one.
-            thread::sleep(DDC_SPACING.saturating_sub(last.elapsed()));
-            let mut waiting: Vec<mpsc::Sender<bool>> = Vec::new();
-            while let Ok(next) = rx.try_recv() {
-                if let MonitorJob::Return { done, .. } = &mut job {
-                    waiting.extend(done.take());
-                }
-                job = next;
-            }
-            let result = match job {
-                MonitorJob::Take { monitor, input } => take_monitor(monitor, input, &mut previous),
-                MonitorJob::Return {
-                    monitor,
-                    from,
-                    fallback,
-                    done,
-                } => {
-                    waiting.extend(done);
-                    let to = previous.take().or(fallback);
-                    return_monitor(monitor, from, to)
-                }
-            };
-            last = Instant::now();
-            match &result {
-                MonitorResult::Failed(e) => eprintln!("monitor: {e}"),
-                other => eprintln!("monitor: {other:?}"),
-            }
-            for done in waiting {
-                let _ = done.send(!matches!(result, MonitorResult::Failed(_)));
-            }
-            let _ = proxy.send_event(UserEvent::Monitor(result));
-        }
-    });
-    tx
-}
-
-fn take_monitor(monitor: Option<String>, input: u16, previous: &mut Option<u16>) -> MonitorResult {
-    let Some(m) = ddc::find(monitor.as_deref()) else {
-        return MonitorResult::Failed("Monitor not found".into());
-    };
-    let current = m.get(ddc::VCP_INPUT).ok();
-    if current == Some(input) {
-        return MonitorResult::Took {
-            name: m.name.clone(),
-            input,
-            previous: None,
-        };
-    }
-    *previous = current;
-    thread::sleep(DDC_STEP);
-    match m.set(ddc::VCP_INPUT, input) {
-        Ok(()) => MonitorResult::Took {
-            name: m.name.clone(),
-            input,
-            previous: current.filter(|c| *c != input),
-        },
-        Err(e) => MonitorResult::Failed(e),
-    }
-}
-
-fn return_monitor(monitor: Option<String>, from: u16, to: Option<u16>) -> MonitorResult {
-    let Some(m) = ddc::find(monitor.as_deref()) else {
-        return MonitorResult::Failed("Monitor not found".into());
-    };
-    match m.get(ddc::VCP_INPUT) {
-        // Something else (a receiver hook, the monitor's buttons) already moved it on.
-        Ok(current) if current != from => {
-            return MonitorResult::Returned {
-                name: m.name.clone(),
-                input: current,
-            }
-        }
-        _ => {}
-    }
-    thread::sleep(DDC_STEP);
-    let Some(to) = to else {
-        return MonitorResult::Failed(format!(
-            "Don't know which input {} had before; switch it back on the monitor",
-            m.name
-        ));
-    };
-    match m.set(ddc::VCP_INPUT, to) {
-        Ok(()) => MonitorResult::Returned {
-            name: m.name.clone(),
-            input: to,
-        },
-        Err(e) => MonitorResult::Failed(e),
-    }
-}
-
 // --- Event tap ---
 
 #[derive(Clone)]
@@ -1384,6 +1288,26 @@ fn create_event_tap(ctx: &TapContext) -> Option<CGEventTap<'static>> {
     Some(tap)
 }
 
+/// Tells the app when displays are added, removed or rearranged (a dock coming back).
+fn watch_displays(proxy: EventLoopProxy<UserEvent>) {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGDisplayRegisterReconfigurationCallback(
+            callback: unsafe extern "C" fn(u32, u32, *mut c_void),
+            user_info: *mut c_void,
+        ) -> i32;
+    }
+    unsafe extern "C" fn changed(_display: u32, flags: u32, user_info: *mut c_void) {
+        // kCGDisplayBeginConfigurationFlag: wait for the matching "done" call.
+        if flags & 1 == 0 {
+            let proxy = &*(user_info as *const Mutex<EventLoopProxy<UserEvent>>);
+            let _ = proxy.lock().unwrap().send_event(UserEvent::DisplaysChanged);
+        }
+    }
+    let user_info = Box::into_raw(Box::new(Mutex::new(proxy))) as *mut c_void;
+    unsafe { CGDisplayRegisterReconfigurationCallback(changed, user_info) };
+}
+
 /// Shows macOS's "allow Accessibility" prompt.
 fn request_accessibility() {
     let key = CFString::new("AXTrustedCheckOptionPrompt");
@@ -1423,7 +1347,9 @@ fn main() {
             Err(err) => eprintln!("ignoring invalid receiver address argument: {err}"),
         }
     }
-    settings.save(&support_dir);
+    if let Err(e) = settings.save(&support_dir) {
+        eprintln!("settings: failed to save: {e}");
+    }
 
     if is_login_item() {
         let _ = set_login_item(true);
@@ -1457,6 +1383,8 @@ fn main() {
 
     // Shared state: Waiting / Connected / Capturing
     let app_state = Arc::new(AtomicU8::new(AppState::Waiting as u8));
+    // Bumped when the receiver address changes, so the heartbeat starts over.
+    let receiver_generation = Arc::new(AtomicU32::new(0));
     let capturing = Arc::new(AtomicBool::new(false));
     let receiver_connected = Arc::new(AtomicBool::new(false));
     let held_keys: Arc<std::sync::Mutex<HashSet<u16>>> =
@@ -1490,12 +1418,19 @@ fn main() {
     let rc = receiver_connected.clone();
     let proxy_hb = proxy.clone();
     let compute_hb = compute_state.clone();
+    let generation = receiver_generation.clone();
     thread::spawn(move || {
         eprintln!("waiting for receiver...");
         let mut buf = [0u8; 8];
         let mut was_connected = false;
         let mut last_recv = Instant::now();
+        let mut seen_generation = 0;
         loop {
+            if generation.load(Ordering::SeqCst) != seen_generation {
+                seen_generation = generation.load(Ordering::SeqCst);
+                was_connected = false;
+                last_recv = Instant::now();
+            }
             match sock_rx.recv(&mut buf) {
                 Ok(n) if Event::from_bytes(&buf[..n]).is_some() => {
                     if !was_connected {
@@ -1553,6 +1488,14 @@ fn main() {
                 .send_event(UserEvent::AudioDevicesChanged);
         });
     }
+    watch_displays(proxy.clone());
+    let monitor_jobs = {
+        let proxy = Mutex::new(proxy.clone());
+        monitor::spawn(support_dir.clone(), move |report| {
+            eprintln!("monitor: {report:?}");
+            let _ = proxy.lock().unwrap().send_event(UserEvent::Monitor(report));
+        })
+    };
 
     // --- Event tap ---
     let tap_ctx = TapContext {
@@ -1638,7 +1581,12 @@ fn main() {
         mtm,
         support_dir,
         mode: Mode::Mac,
-        monitor_jobs: spawn_monitor_worker(proxy.clone()),
+        monitor_jobs,
+        receiver_generation,
+        display_check_at: None,
+        passthrough_retry_at: None,
+        input_watch: None,
+        torn_down: false,
         settings,
         socket,
         tap_ctx,
@@ -1666,15 +1614,6 @@ fn main() {
         _lifecycle_guard: (workspace_center, distributed_center, lifecycle_observer),
     };
 
-    // A previous run quit or crashed in PS5 mode: hand the monitor back.
-    if let Some(restore) = app.settings.restore_input {
-        let _ = app.monitor_jobs.send(MonitorJob::Return {
-            monitor: app.settings.monitor.clone(),
-            from: app.settings.ps5_input,
-            fallback: Some(restore),
-            done: None,
-        });
-    }
     app.refresh_menu();
     app.schedule_tick();
 
@@ -1709,7 +1648,15 @@ struct App {
     app_state: Arc<AtomicU8>,
     passthrough: Option<Passthrough>,
     passthrough_error: Option<String>,
-    monitor_jobs: mpsc::Sender<MonitorJob>,
+    /// The DDC worker. A claim left by a crash is handed back as it starts.
+    monitor_jobs: mpsc::Sender<Job>,
+    receiver_generation: Arc<AtomicU32>,
+    /// Debounced retry of an owed hand-back after wake or display changes.
+    display_check_at: Option<Instant>,
+    passthrough_retry_at: Option<Instant>,
+    /// Watchdog: the input's frame count and when it last moved.
+    input_watch: Option<(usize, Instant)>,
+    torn_down: bool,
     monitor_line: String,
     /// PS5 mode is waiting for the microphone prompt before switching the monitor away.
     awaiting_mic: Option<Instant>,
@@ -1738,36 +1685,29 @@ struct App {
 impl App {
     fn handle(&mut self, event: tao::event::Event<UserEvent>, control_flow: &mut ControlFlow) {
         match event {
-            tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) => {
-                self.on_timers()
-            }
-            tao::event::Event::LoopDestroyed => {
-                if self.receiver_hook_active {
-                    self.receiver_hook_active = false;
-                    run_hook(HookKind::ReceiverDisconnected, true, &[]);
-                }
-            }
+            // Also the path for a native termination (Tao's applicationWillTerminate).
+            tao::event::Event::LoopDestroyed => self.teardown("exit"),
             tao::event::Event::UserEvent(ue) => self.on_user_event(ue),
             _ => {}
         }
+        // Due timers run whatever woke the loop, so a late one can't leave it spinning.
+        self.on_timers();
 
         let next_wake = [
             self.flash_until,
             self.reset_update_at,
             self.next_tick,
             self.audio_check_at,
+            self.display_check_at,
+            self.passthrough_retry_at,
         ]
         .into_iter()
         .flatten()
         .min();
-        *control_flow = if self.quitting {
-            ControlFlow::Exit
-        } else {
-            match next_wake {
-                Some(t) if t > Instant::now() => ControlFlow::WaitUntil(t),
-                Some(_) => ControlFlow::Poll,
-                None => ControlFlow::Wait,
-            }
+        *control_flow = match (self.quitting, next_wake) {
+            (true, _) => ControlFlow::Exit,
+            (false, Some(t)) => ControlFlow::WaitUntil(t),
+            (false, None) => ControlFlow::Wait,
         };
     }
 
@@ -1785,6 +1725,17 @@ impl App {
         if self.audio_check_at.is_some_and(|t| now >= t) {
             self.audio_check_at = None;
             self.check_audio();
+        }
+        if self.passthrough_retry_at.is_some_and(|t| now >= t) {
+            self.passthrough_retry_at = None;
+            if self.wants_passthrough() && self.passthrough.is_none() {
+                self.start_passthrough();
+            }
+        }
+        if self.display_check_at.is_some_and(|t| now >= t) {
+            self.display_check_at = None;
+            // Only acts on an owed hand-back; a refused take is never retried on its own.
+            let _ = self.monitor_jobs.send(Job::Reconcile);
         }
         if self.next_tick.is_some_and(|t| now >= t) {
             self.tick();
@@ -1843,6 +1794,16 @@ impl App {
             UserEvent::Settings(action) => self.settings_action(action),
             UserEvent::AudioDevicesChanged => {
                 self.audio_check_at = Some(Instant::now() + AUDIO_SETTLE);
+            }
+            // Sleep ends PS5 mode: its audio stops anyway. If the hand-back can't finish
+            // before the Mac sleeps, it is owed and runs after wake.
+            UserEvent::WillSleep => {
+                if self.mode == Mode::Ps5 {
+                    self.switch_to(Mode::Mac, false);
+                }
+            }
+            UserEvent::DisplaysChanged => {
+                self.display_check_at = Some(Instant::now() + DISPLAY_SETTLE);
             }
             UserEvent::Menu(me) => self.menu_event(me),
         }
@@ -1908,11 +1869,8 @@ impl App {
         }
 
         // Monitor input.
-        match (
-            self.settings.monitor_input(from),
-            self.settings.monitor_input(target),
-        ) {
-            (_, Some(input)) => {
+        match self.settings.monitor_input(target) {
+            Some(input) => {
                 if wants_passthrough && matches!(passthrough::mic_access(), MicAccess::Undetermined)
                 {
                     passthrough::request_mic_access();
@@ -1922,15 +1880,10 @@ impl App {
                     self.take_monitor(input);
                 }
             }
-            (Some(from_input), None) => {
-                let _ = self.monitor_jobs.send(MonitorJob::Return {
-                    monitor: self.settings.monitor.clone(),
-                    from: from_input,
-                    fallback: self.settings.restore_input,
-                    done: None,
-                });
+            // The worker hands back whatever it holds, using the claim's own monitor and inputs.
+            None => {
+                let _ = self.monitor_jobs.send(Job::Want(Want::Release));
             }
-            (None, None) => {}
         }
 
         if target == Mode::Windows {
@@ -1951,12 +1904,13 @@ impl App {
         self.schedule_tick();
     }
 
+    /// The monitor and input are fixed here; later Settings edits don't change this request.
     fn take_monitor(&mut self, input: u16) {
         self.monitor_line = format!("Switching to {}…", ddc::input_name(input));
-        let _ = self.monitor_jobs.send(MonitorJob::Take {
+        let _ = self.monitor_jobs.send(Job::Want(Want::Hold {
             monitor: self.settings.monitor.clone(),
             input,
-        });
+        }));
     }
 
     fn wants_passthrough(&self) -> bool {
@@ -1975,12 +1929,15 @@ impl App {
                 eprintln!("passthrough: started from {input}");
                 self.passthrough = Some(p);
                 self.passthrough_error = None;
+                self.passthrough_retry_at = None;
+                self.input_watch = None;
             }
             Err(e) => {
                 if self.passthrough_error.as_deref() != Some(e.as_str()) {
                     eprintln!("passthrough: {e}");
                 }
                 self.passthrough_error = Some(e);
+                self.passthrough_retry_at = Some(Instant::now() + PASSTHROUGH_RETRY);
             }
         }
     }
@@ -2030,10 +1987,23 @@ impl App {
                 }
             }
         }
-        // Safety net for a device that dies without a device-list change.
+        // Safety nets: a device that dies without a device-list change, and an input that
+        // stops delivering while its device still looks alive.
         let dead = self.passthrough.as_ref().is_some_and(|p| !p.is_alive());
         if dead && self.audio_check_at.is_none() {
             self.audio_check_at = Some(Instant::now() + AUDIO_SETTLE);
+        }
+        if let Some(frames) = self.passthrough.as_ref().map(|p| p.frames_in()) {
+            match self.input_watch {
+                Some((seen, since)) if seen == frames => {
+                    if since.elapsed() > PASSTHROUGH_STALL {
+                        eprintln!("passthrough: input stalled, restarting");
+                        self.passthrough = None;
+                        self.start_passthrough();
+                    }
+                }
+                _ => self.input_watch = Some((frames, Instant::now())),
+            }
         }
         self.refresh_status_lines();
         self.schedule_tick();
@@ -2050,27 +2020,17 @@ impl App {
         self.next_tick = every.map(|d| Instant::now() + d);
     }
 
-    fn monitor_result(&mut self, result: MonitorResult) {
-        match result {
-            MonitorResult::Took {
+    fn monitor_result(&mut self, report: Report) {
+        self.monitor_line = match report {
+            Report::Holding { name, input } => format!("{name} on {}", ddc::input_name(input)),
+            Report::Released {
                 name,
-                input,
-                previous,
-            } => {
-                self.monitor_line = format!("{name} on {}", ddc::input_name(input));
-                if previous.is_some() {
-                    self.settings.restore_input = previous;
-                    self.save();
-                }
-            }
-            MonitorResult::Returned { name, input } => {
-                self.monitor_line = format!("{name} back on {}", ddc::input_name(input));
-                if self.settings.restore_input.take().is_some() {
-                    self.save();
-                }
-            }
-            MonitorResult::Failed(e) => self.monitor_line = e,
-        }
+                input: Some(input),
+            } => format!("{name} back on {}", ddc::input_name(input)),
+            Report::Released { name, input: None } => format!("{name} left as it was"),
+            Report::Refused(e) => e,
+            Report::Owed(e) => e,
+        };
         self.refresh_status_lines();
     }
 
@@ -2186,6 +2146,18 @@ impl App {
                     return;
                 }
                 eprintln!("receiver address changed to {addr}");
+                // Forget the old receiver: not connected until the new one answers.
+                self.receiver_generation.fetch_add(1, Ordering::SeqCst);
+                self.receiver_connected.store(false, Ordering::SeqCst);
+                store_state(
+                    &self.tap_ctx.capturing,
+                    &self.receiver_connected,
+                    &self.app_state,
+                );
+                if self.receiver_hook_active {
+                    self.receiver_hook_active = false;
+                    run_hook(HookKind::ReceiverDisconnected, false, &[]);
+                }
                 self.settings.receiver = Some(addr);
                 self.save();
                 note(self, "Saved. Looking for the PC…", false);
@@ -2223,26 +2195,25 @@ impl App {
         self.ui.update_item.set_enabled(true);
     }
 
-    /// Leave the current mode cleanly before quitting or relaunching.
+    /// Leave the current mode cleanly before quitting or relaunching. Waits for any owed
+    /// hand-back, whatever the mode is now. Runs once.
     fn teardown(&mut self, reason: &str) {
+        if std::mem::replace(&mut self.torn_down, true) {
+            return;
+        }
         self.release_capture(reason);
         self.passthrough = None;
-        if let Some(from) = self.settings.monitor_input(self.mode) {
-            let (done, wait) = mpsc::channel();
-            let _ = self.monitor_jobs.send(MonitorJob::Return {
-                monitor: self.settings.monitor.clone(),
-                from,
-                fallback: self.settings.restore_input,
-                done: Some(done),
-            });
-            if wait.recv_timeout(Duration::from_secs(4)) == Ok(true) {
-                self.settings.restore_input = None;
-                self.save();
-            }
-        }
         if self.mode != Mode::Mac {
             run_hook(HookKind::ModeChanged, true, &[self.mode.key(), "mac"]);
             self.mode = Mode::Mac;
+        }
+        let (done, wait) = mpsc::channel();
+        let _ = self.monitor_jobs.send(Job::Want(Want::Release));
+        let _ = self.monitor_jobs.send(Job::Flush(done));
+        if wait.recv_timeout(HAND_BACK_WAIT).is_err() {
+            eprintln!(
+                "monitor: hand-back still running at {reason}; it is owed to the next launch"
+            );
         }
         if let Some(activity) = self.power_activity.take() {
             activity.stop();
@@ -2254,7 +2225,9 @@ impl App {
     }
 
     fn save(&self) {
-        self.settings.save(&self.support_dir);
+        if let Err(e) = self.settings.save(&self.support_dir) {
+            eprintln!("settings: failed to save: {e}");
+        }
     }
 
     fn pc_status(&self) -> String {

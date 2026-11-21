@@ -1,14 +1,15 @@
 //! Low-latency audio passthrough: a local input (the dock's "Microphone In", fed by the
 //! monitor's audio out) played to the default output. Two HAL units joined by a lock-free
 //! ring that trims clock drift, ported from the PS5 Loop app it replaces.
+//!
+//! The render callbacks are plain C functions over state this module owns: nothing in them
+//! allocates or locks, the input buffer has a fixed size, and the state is freed only after
+//! both units have been stopped and disposed, also when setup fails halfway.
 
-use coreaudio::audio_unit::audio_format::LinearPcmFlags;
 use coreaudio::audio_unit::macos_helpers::{
-    audio_unit_from_device_id, get_audio_device_ids_for_scope, get_default_device_id,
-    get_device_name,
+    get_audio_device_ids_for_scope, get_default_device_id, get_device_name,
 };
-use coreaudio::audio_unit::render_callback::{data, Args};
-use coreaudio::audio_unit::{AudioUnit, Element, IOType, SampleFormat, Scope, StreamFormat};
+use coreaudio::audio_unit::Scope;
 use coreaudio::sys;
 use objc2::msg_send;
 use objc2::runtime::AnyClass;
@@ -19,6 +20,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const RING_FRAMES: usize = 16384;
+/// Largest input callback served. A bigger one is skipped rather than allocating on the
+/// audio thread; devices deliver far less (64 to 1024 frames).
+const MAX_FRAMES: usize = 4096;
 /// IO buffer asked of both devices; they may round it up.
 const IO_FRAMES: u32 = 64;
 /// The dock's preamp distorts above about +18 dB, so the rest of the level comes from here.
@@ -36,7 +40,231 @@ struct Ring {
     peak: AtomicU32,
 }
 
+/// An output-type audio unit, stopped and disposed when dropped.
+struct Unit(sys::AudioUnit);
+
+impl Unit {
+    fn new(sub_type: u32) -> Result<Unit, String> {
+        let desc = sys::AudioComponentDescription {
+            componentType: sys::kAudioUnitType_Output as u32,
+            componentSubType: sub_type,
+            componentManufacturer: sys::kAudioUnitManufacturer_Apple as u32,
+            componentFlags: 0,
+            componentFlagsMask: 0,
+        };
+        unsafe {
+            let component = sys::AudioComponentFindNext(ptr::null_mut(), &desc);
+            if component.is_null() {
+                return Err("no audio output component".into());
+            }
+            let mut unit: sys::AudioUnit = ptr::null_mut();
+            check(
+                sys::AudioComponentInstanceNew(component, &mut unit),
+                "audio unit",
+            )?;
+            Ok(Unit(unit))
+        }
+    }
+
+    fn set<T>(
+        &self,
+        property: u32,
+        scope: u32,
+        element: u32,
+        value: &T,
+        what: &str,
+    ) -> Result<(), String> {
+        check(
+            unsafe {
+                sys::AudioUnitSetProperty(
+                    self.0,
+                    property,
+                    scope,
+                    element,
+                    value as *const T as *const c_void,
+                    std::mem::size_of::<T>() as u32,
+                )
+            },
+            what,
+        )
+    }
+}
+
+impl Drop for Unit {
+    fn drop(&mut self) {
+        unsafe {
+            sys::AudioOutputUnitStop(self.0);
+            sys::AudioUnitUninitialize(self.0);
+            sys::AudioComponentInstanceDispose(self.0);
+        }
+    }
+}
+
+fn check(status: sys::OSStatus, what: &str) -> Result<(), String> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!("{what} failed ({status})"))
+    }
+}
+
+struct InputState {
+    unit: sys::AudioUnit,
+    buffer: Box<[f32]>,
+    ring: Arc<Ring>,
+    gain: f32,
+}
+
+struct OutputState {
+    ring: Arc<Ring>,
+    primed: bool,
+}
+
+/// The callbacks' state. Freed on drop, which must come after both units are gone.
+struct Callbacks {
+    input: *mut InputState,
+    output: *mut OutputState,
+}
+
+impl Callbacks {
+    fn new(ring: &Arc<Ring>, gain: f32) -> Self {
+        Callbacks {
+            input: Box::into_raw(Box::new(InputState {
+                unit: ptr::null_mut(),
+                buffer: vec![0.0; MAX_FRAMES * 2].into_boxed_slice(),
+                ring: ring.clone(),
+                gain,
+            })),
+            output: Box::into_raw(Box::new(OutputState {
+                ring: ring.clone(),
+                primed: false,
+            })),
+        }
+    }
+}
+
+impl Drop for Callbacks {
+    fn drop(&mut self) {
+        unsafe {
+            drop(Box::from_raw(self.input));
+            drop(Box::from_raw(self.output));
+        }
+    }
+}
+
+unsafe extern "C" fn input_proc(
+    refcon: *mut c_void,
+    flags: *mut sys::AudioUnitRenderActionFlags,
+    time: *const sys::AudioTimeStamp,
+    bus: u32,
+    frames: u32,
+    _data: *mut sys::AudioBufferList,
+) -> sys::OSStatus {
+    let state = &mut *(refcon as *mut InputState);
+    let n = frames as usize;
+    if n > MAX_FRAMES {
+        return -50; // paramErr: skip this block
+    }
+    let mut list = sys::AudioBufferList {
+        mNumberBuffers: 1,
+        mBuffers: [sys::AudioBuffer {
+            mNumberChannels: 2,
+            mDataByteSize: (n * 8) as u32,
+            mData: state.buffer.as_mut_ptr() as *mut c_void,
+        }],
+    };
+    let status = sys::AudioUnitRender(state.unit, flags, time, bus, frames, &mut list);
+    if status != 0 {
+        return status;
+    }
+    let ring = &state.ring;
+    let mut w = ring.write.load(Ordering::Relaxed);
+    let mut peak = 0f32;
+    for frame in state.buffer[..n * 2].chunks_exact(2) {
+        let (l, r) = (frame[0], frame[1]);
+        peak = peak.max(l.abs()).max(r.abs());
+        let p = (w % RING_FRAMES) * 2;
+        ring.samples[p].store(limit(l * state.gain).to_bits(), Ordering::Relaxed);
+        ring.samples[p + 1].store(limit(r * state.gain).to_bits(), Ordering::Relaxed);
+        w += 1;
+    }
+    ring.write.store(w, Ordering::Release);
+    ring.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+    0
+}
+
+unsafe extern "C" fn output_proc(
+    refcon: *mut c_void,
+    _flags: *mut sys::AudioUnitRenderActionFlags,
+    _time: *const sys::AudioTimeStamp,
+    _bus: u32,
+    frames: u32,
+    data: *mut sys::AudioBufferList,
+) -> sys::OSStatus {
+    let state = &mut *(refcon as *mut OutputState);
+    if data.is_null() || (*data).mNumberBuffers == 0 {
+        return 0;
+    }
+    let buffer = &mut (*data).mBuffers[0];
+    let channels = (buffer.mNumberChannels as usize).max(1);
+    let n = (frames as usize).min(buffer.mDataByteSize as usize / (4 * channels));
+    let out = std::slice::from_raw_parts_mut(buffer.mData as *mut f32, n * channels);
+    let ring = &state.ring;
+    if ring.reprime.swap(false, Ordering::Relaxed) {
+        state.primed = false;
+    }
+    let w = ring.write.load(Ordering::Acquire);
+    let mut r = ring.read.load(Ordering::Relaxed);
+    let target = ring.target.load(Ordering::Relaxed);
+    let mut avail = w.wrapping_sub(r);
+    if !state.primed {
+        if avail < target + n {
+            out.fill(0.0);
+            return 0;
+        }
+        state.primed = true;
+    }
+    // The dock and the output run on different clocks: drop back to target when behind.
+    if avail > target * 2 + n {
+        r = w - target - n;
+        avail = target + n;
+    }
+    for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
+        frame.fill(0.0);
+        if i < avail {
+            let p = (r % RING_FRAMES) * 2;
+            for (c, sample) in frame.iter_mut().take(2).enumerate() {
+                *sample = f32::from_bits(ring.samples[p + c].load(Ordering::Relaxed));
+            }
+            r += 1;
+        }
+    }
+    if avail < n {
+        state.primed = false;
+    }
+    ring.read.store(r, Ordering::Release);
+    0
+}
+
+fn stereo_float(rate: f64) -> sys::AudioStreamBasicDescription {
+    sys::AudioStreamBasicDescription {
+        mSampleRate: rate,
+        mFormatID: sys::kAudioFormatLinearPCM as u32,
+        mFormatFlags: (sys::kAudioFormatFlagIsFloat | sys::kAudioFormatFlagIsPacked) as u32,
+        mBytesPerPacket: 8,
+        mFramesPerPacket: 1,
+        mBytesPerFrame: 8,
+        mChannelsPerFrame: 2,
+        mBitsPerChannel: 32,
+        mReserved: 0,
+    }
+}
+
 pub struct Passthrough {
+    // Field order matters: the units stop and go before the callback state they point at.
+    input_unit: Unit,
+    output_unit: Unit,
+    _callbacks: Callbacks,
     input_name: String,
     input_id: u32,
     in_rate: f64,
@@ -45,9 +273,6 @@ pub struct Passthrough {
     output_id: u32,
     output_name: String,
     ring: Arc<Ring>,
-    // Dropping a unit stops it; the input goes first.
-    input_unit: AudioUnit,
-    output_unit: AudioUnit,
 }
 
 pub struct Status {
@@ -73,13 +298,7 @@ impl Passthrough {
         )
         .unwrap_or(48000.0);
         let in_frames = set_buffer_frames(input_id, sys::kAudioObjectPropertyScopeInput);
-        let asbd = StreamFormat {
-            sample_rate: in_rate,
-            sample_format: SampleFormat::F32,
-            flags: LinearPcmFlags::IS_FLOAT | LinearPcmFlags::IS_PACKED,
-            channels: 2,
-        }
-        .to_asbd();
+        let format = stereo_float(in_rate);
         let ring = Arc::new(Ring {
             samples: (0..RING_FRAMES * 2).map(|_| AtomicU32::new(0)).collect(),
             write: AtomicUsize::new(0),
@@ -89,98 +308,62 @@ impl Passthrough {
             peak: AtomicU32::new(0),
         });
 
-        let mut input = audio_unit_from_device_id(input_id, true).map_err(err("input unit"))?;
-        input.uninitialize().map_err(err("input unit"))?;
-        input
-            .set_property(
-                sys::kAudioUnitProperty_StreamFormat,
-                Scope::Output,
-                Element::Input,
-                Some(&asbd),
-            )
-            .map_err(err("input format"))?;
-        let gain = 10f32.powf(GAIN_DB / 20.0);
-        let writer = ring.clone();
-        input
-            .set_input_callback(move |args: Args<data::Interleaved<f32>>| {
-                let ring = &writer;
-                let channels = args.data.channels.max(1);
-                let mut w = ring.write.load(Ordering::Relaxed);
-                let mut peak = 0f32;
-                for frame in args.data.buffer.chunks_exact(channels) {
-                    let (l, r) = (frame[0], *frame.get(1).unwrap_or(&frame[0]));
-                    peak = peak.max(l.abs()).max(r.abs());
-                    let p = (w % RING_FRAMES) * 2;
-                    ring.samples[p].store(limit(l * gain).to_bits(), Ordering::Relaxed);
-                    ring.samples[p + 1].store(limit(r * gain).to_bits(), Ordering::Relaxed);
-                    w += 1;
-                }
-                ring.write.store(w, Ordering::Release);
-                ring.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
-                Ok(())
-            })
-            .map_err(err("input callback"))?;
+        // Declared before the units, so on any early return the units are dropped first.
+        let callbacks = Callbacks::new(&ring, 10f32.powf(GAIN_DB / 20.0));
+        let (global, input_scope, output_scope) = (
+            sys::kAudioUnitScope_Global as u32,
+            sys::kAudioUnitScope_Input as u32,
+            sys::kAudioUnitScope_Output as u32,
+        );
+
+        let input = Unit::new(sys::kAudioUnitSubType_HALOutput as u32)?;
+        let (on, off) = (1u32, 0u32);
+        let enable_io = sys::kAudioOutputUnitProperty_EnableIO as u32;
+        input.set(enable_io, input_scope, 1, &on, "enable input")?;
+        input.set(enable_io, output_scope, 0, &off, "disable output")?;
+        input.set(
+            sys::kAudioOutputUnitProperty_CurrentDevice as u32,
+            global,
+            0,
+            &input_id,
+            "input device",
+        )?;
+        let stream_format = sys::kAudioUnitProperty_StreamFormat as u32;
+        input.set(stream_format, output_scope, 1, &format, "input format")?;
+        unsafe { (*callbacks.input).unit = input.0 };
+        let input_callback = sys::AURenderCallbackStruct {
+            inputProc: Some(input_proc),
+            inputProcRefCon: callbacks.input as *mut c_void,
+        };
+        input.set(
+            sys::kAudioOutputUnitProperty_SetInputCallback as u32,
+            global,
+            0,
+            &input_callback,
+            "input callback",
+        )?;
 
         // DefaultOutput follows the system default device and converts the sample rate.
-        let mut output = AudioUnit::new(IOType::DefaultOutput).map_err(err("output unit"))?;
-        output.uninitialize().map_err(err("output unit"))?;
-        output
-            .set_property(
-                sys::kAudioUnitProperty_StreamFormat,
-                Scope::Input,
-                Element::Output,
-                Some(&asbd),
-            )
-            .map_err(err("output format"))?;
-        let reader = ring.clone();
-        let mut primed = false;
-        output
-            .set_render_callback(move |args: Args<data::Interleaved<f32>>| {
-                let ring = &reader;
-                let channels = args.data.channels.max(1);
-                let n = args.num_frames;
-                let out = args.data.buffer;
-                if ring.reprime.swap(false, Ordering::Relaxed) {
-                    primed = false;
-                }
-                let w = ring.write.load(Ordering::Acquire);
-                let mut r = ring.read.load(Ordering::Relaxed);
-                let target = ring.target.load(Ordering::Relaxed);
-                let mut avail = w.wrapping_sub(r);
-                if !primed {
-                    if avail < target + n {
-                        out.fill(0.0);
-                        return Ok(());
-                    }
-                    primed = true;
-                }
-                // The dock and the output run on different clocks: drop back to target when behind.
-                if avail > target * 2 + n {
-                    r = w - target - n;
-                    avail = target + n;
-                }
-                for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
-                    frame.fill(0.0);
-                    if i < avail {
-                        let p = (r % RING_FRAMES) * 2;
-                        for (c, sample) in frame.iter_mut().take(2).enumerate() {
-                            *sample = f32::from_bits(ring.samples[p + c].load(Ordering::Relaxed));
-                        }
-                        r += 1;
-                    }
-                }
-                if avail < n {
-                    primed = false;
-                }
-                ring.read.store(r, Ordering::Release);
-                Ok(())
-            })
-            .map_err(err("output callback"))?;
-
-        input.initialize().map_err(err("input unit"))?;
-        output.initialize().map_err(err("output unit"))?;
+        let output = Unit::new(sys::kAudioUnitSubType_DefaultOutput as u32)?;
+        output.set(stream_format, input_scope, 0, &format, "output format")?;
+        let output_callback = sys::AURenderCallbackStruct {
+            inputProc: Some(output_proc),
+            inputProcRefCon: callbacks.output as *mut c_void,
+        };
+        output.set(
+            sys::kAudioUnitProperty_SetRenderCallback as u32,
+            input_scope,
+            0,
+            &output_callback,
+            "output callback",
+        )?;
+        check(unsafe { sys::AudioUnitInitialize(input.0) }, "input init")?;
+        check(unsafe { sys::AudioUnitInitialize(output.0) }, "output init")?;
 
         let mut this = Self {
+            input_unit: input,
+            output_unit: output,
+            _callbacks: callbacks,
             input_name: input_name.to_string(),
             input_id,
             in_rate,
@@ -189,13 +372,22 @@ impl Passthrough {
             output_id: 0,
             output_name: String::new(),
             ring,
-            input_unit: input,
-            output_unit: output,
         };
         this.apply_output();
-        this.input_unit.start().map_err(err("input start"))?;
-        this.output_unit.start().map_err(err("output start"))?;
+        check(
+            unsafe { sys::AudioOutputUnitStart(this.input_unit.0) },
+            "input start",
+        )?;
+        check(
+            unsafe { sys::AudioOutputUnitStart(this.output_unit.0) },
+            "output start",
+        )?;
         Ok(this)
+    }
+
+    /// Frames the input has delivered so far; a watchdog checks that it moves.
+    pub fn frames_in(&self) -> usize {
+        self.ring.write.load(Ordering::Relaxed)
     }
 
     /// Re-targets the ring when the default output has changed. The DefaultOutput unit
@@ -265,10 +457,6 @@ impl Passthrough {
             in_ms + ring_ms + out_ms
         );
     }
-}
-
-fn err(what: &'static str) -> impl Fn(coreaudio::Error) -> String {
-    move |e| format!("{what}: {e:?}")
 }
 
 /// Soft limiter above -0.45 dBFS.

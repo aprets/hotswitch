@@ -279,29 +279,28 @@ impl SettingsWindow {
             .setStringValue(&ns(settings.receiver.as_deref().unwrap_or("")));
         self.set_receiver_note(pc_status, false);
 
-        // Monitors: what DDC finds now, plus the saved one if it is switched off.
-        let found = ddc::monitors();
+        // Monitors DDC may target (registry only, nothing is sent), plus the saved one if it
+        // is switched off. With no choice saved and several to pick from, nothing is chosen.
+        let targetable = ddc::Layout::read().targetable();
         let mut ids: Vec<Option<String>> = Vec::new();
         let mut titles: Vec<String> = Vec::new();
-        for m in &found {
-            let twin = found.iter().filter(|o| o.name == m.name).count() > 1;
-            ids.push(Some(m.id().to_string()));
-            titles.push(if twin && !m.serial.is_empty() {
-                format!("{} · {}", m.name, m.serial)
+        if settings.monitor.is_none() && targetable.len() != 1 {
+            ids.push(None);
+            titles.push(if targetable.is_empty() {
+                "No monitor can be used".into()
             } else {
-                m.name.clone()
+                "Choose a monitor".into()
             });
         }
-        match &settings.monitor {
-            Some(saved) if !ids.contains(&Some(saved.clone())) => {
+        for m in &targetable {
+            ids.push(Some(m.serial.clone()));
+            titles.push(m.label());
+        }
+        if let Some(saved) = &settings.monitor {
+            if !ids.contains(&Some(saved.clone())) {
                 ids.push(Some(saved.clone()));
                 titles.push(format!("{saved} (not connected)"));
             }
-            None if ids.is_empty() => {
-                ids.push(None);
-                titles.push("No external monitor found".into());
-            }
-            _ => {}
         }
         let selected = match &settings.monitor {
             Some(saved) => ids.iter().position(|id| id.as_deref() == Some(saved)),
