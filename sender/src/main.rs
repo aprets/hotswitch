@@ -628,6 +628,11 @@ fn hook_path(kind: HookKind) -> PathBuf {
 fn run_hook(kind: HookKind, wait: bool, args: &[&str]) {
     let path = hook_path(kind);
     let label = kind.label();
+    // Hooks switch real hardware (BetterDisplay, DDC), so a dry run never runs them.
+    if settings::dry_run() {
+        eprintln!("hook {label}: skipped in a dry run");
+        return;
+    }
     let metadata = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -681,7 +686,11 @@ fn log_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
         .join("Library/Logs")
-        .join("hotswitch-sender.log")
+        .join(if settings::dry_run() {
+            "hotswitch-sender-dry-run.log"
+        } else {
+            "hotswitch-sender.log"
+        })
 }
 
 fn redirect_stdio_to_log() -> PathBuf {
@@ -725,6 +734,10 @@ fn xml_escape(s: &str) -> String {
 
 fn set_login_item(enabled: bool) -> bool {
     let path = launch_agent_path();
+    if settings::dry_run() {
+        eprintln!("set_login_item: skipped in a dry run");
+        return false;
+    }
     eprintln!("set_login_item: enabled={enabled}, path={}", path.display());
     if enabled {
         let exe = match std::env::current_exe() {
@@ -1315,6 +1328,39 @@ fn request_accessibility() {
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) };
 }
 
+/// Holds an exclusive lock on `instance.lock` for the life of the process.
+fn single_instance() -> Option<std::fs::File> {
+    let dir = settings::real_support_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("instance.lock"))
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Publish "connected" only if the receiver address hasn't changed since `seen`. Holding the
+/// generation lock while publishing means an address change can't slip in between.
+fn publish_if_current(generation: &Mutex<u32>, seen: u32, publish: impl FnOnce()) -> bool {
+    let current = generation.lock().unwrap();
+    if *current == seen {
+        publish();
+        true
+    } else {
+        false
+    }
+}
+
+/// A new receiver address: not connected until a heartbeat arrives from it.
+fn start_new_receiver(generation: &Mutex<u32>, connected: &AtomicBool) {
+    let mut current = generation.lock().unwrap();
+    *current += 1;
+    connected.store(false, Ordering::SeqCst);
+}
+
 fn store_state(
     capturing: &AtomicBool,
     receiver_connected: &AtomicBool,
@@ -1338,6 +1384,12 @@ fn main() {
         return;
     }
 
+    // One Hotswitch at a time (dry run or not), so only one process owns monitor claims.
+    // Taken before the log is opened, so a second copy doesn't truncate the first one's log.
+    let Some(_instance) = single_instance() else {
+        eprintln!("Hotswitch is already running");
+        return;
+    };
     let log_file_path = redirect_stdio_to_log();
     let support_dir = app_support_dir();
     let mut settings = Settings::load(&support_dir);
@@ -1384,7 +1436,7 @@ fn main() {
     // Shared state: Waiting / Connected / Capturing
     let app_state = Arc::new(AtomicU8::new(AppState::Waiting as u8));
     // Bumped when the receiver address changes, so the heartbeat starts over.
-    let receiver_generation = Arc::new(AtomicU32::new(0));
+    let receiver_generation = Arc::new(Mutex::new(0u32));
     let capturing = Arc::new(AtomicBool::new(false));
     let receiver_connected = Arc::new(AtomicBool::new(false));
     let held_keys: Arc<std::sync::Mutex<HashSet<u16>>> =
@@ -1426,21 +1478,24 @@ fn main() {
         let mut last_recv = Instant::now();
         let mut seen_generation = 0;
         loop {
-            if generation.load(Ordering::SeqCst) != seen_generation {
-                seen_generation = generation.load(Ordering::SeqCst);
+            let current = *generation.lock().unwrap();
+            if current != seen_generation {
+                seen_generation = current;
                 was_connected = false;
                 last_recv = Instant::now();
             }
             match sock_rx.recv(&mut buf) {
                 Ok(n) if Event::from_bytes(&buf[..n]).is_some() => {
-                    if !was_connected {
-                        eprintln!("receiver connected");
-                        rc.store(true, Ordering::SeqCst);
-                        was_connected = true;
-                        compute_hb();
-                        let _ = proxy_hb.send_event(UserEvent::StateChanged);
-                    }
-                    last_recv = Instant::now();
+                    publish_if_current(&generation, seen_generation, || {
+                        if !was_connected {
+                            eprintln!("receiver connected");
+                            rc.store(true, Ordering::SeqCst);
+                            was_connected = true;
+                            compute_hb();
+                            let _ = proxy_hb.send_event(UserEvent::StateChanged);
+                        }
+                        last_recv = Instant::now();
+                    });
                 }
                 _ => {}
             }
@@ -1550,6 +1605,12 @@ fn main() {
         ps5_shown: false,
         access_shown: false,
     };
+    if settings::dry_run() {
+        let _ = ui.menu.append_items(&[
+            &MenuItem::new("Dry run: monitors simulated, hooks off", false, None),
+            &PredefinedMenuItem::separator(),
+        ]);
+    }
     let _ = ui.menu.append_items(&[
         &ui.modes[0],
         &ui.modes[1],
@@ -1574,6 +1635,7 @@ fn main() {
         .with_tooltip("Hotswitch")
         .with_icon(make_icon(0, 0, 0, false))
         .with_icon_as_template(true)
+        .with_title(if settings::dry_run() { "DRY RUN" } else { "" })
         .build()
         .expect("Failed to create tray icon");
 
@@ -1620,6 +1682,15 @@ fn main() {
     event_loop.run(move |event, _, control_flow| app.handle(event, control_flow));
 }
 
+/// Items above the modes: the dry-run line and its separator.
+fn menu_top() -> usize {
+    if settings::dry_run() {
+        2
+    } else {
+        0
+    }
+}
+
 struct MenuUi {
     menu: Menu,
     modes: [CheckMenuItem; 3],
@@ -1650,7 +1721,7 @@ struct App {
     passthrough_error: Option<String>,
     /// The DDC worker. A claim left by a crash is handed back as it starts.
     monitor_jobs: mpsc::Sender<Job>,
-    receiver_generation: Arc<AtomicU32>,
+    receiver_generation: Arc<Mutex<u32>>,
     /// Debounced retry of an owed hand-back after wake or display changes.
     display_check_at: Option<Instant>,
     passthrough_retry_at: Option<Instant>,
@@ -2147,8 +2218,7 @@ impl App {
                 }
                 eprintln!("receiver address changed to {addr}");
                 // Forget the old receiver: not connected until the new one answers.
-                self.receiver_generation.fetch_add(1, Ordering::SeqCst);
-                self.receiver_connected.store(false, Ordering::SeqCst);
+                start_new_receiver(&self.receiver_generation, &self.receiver_connected);
                 store_state(
                     &self.tap_ctx.capturing,
                     &self.receiver_connected,
@@ -2203,10 +2273,7 @@ impl App {
         }
         self.release_capture(reason);
         self.passthrough = None;
-        if self.mode != Mode::Mac {
-            run_hook(HookKind::ModeChanged, true, &[self.mode.key(), "mac"]);
-            self.mode = Mode::Mac;
-        }
+        // The hand-back goes first, so no hook can hold it up.
         let (done, wait) = mpsc::channel();
         let _ = self.monitor_jobs.send(Job::Want(Want::Release));
         let _ = self.monitor_jobs.send(Job::Flush(done));
@@ -2214,6 +2281,10 @@ impl App {
             eprintln!(
                 "monitor: hand-back still running at {reason}; it is owed to the next launch"
             );
+        }
+        if self.mode != Mode::Mac {
+            run_hook(HookKind::ModeChanged, true, &[self.mode.key(), "mac"]);
+            self.mode = Mode::Mac;
         }
         if let Some(activity) = self.power_activity.take() {
             activity.stop();
@@ -2263,7 +2334,7 @@ impl App {
                 &self.ui.route_line,
             ];
             if ps5 {
-                let _ = self.ui.menu.insert_items(&lines, 4);
+                let _ = self.ui.menu.insert_items(&lines, 4 + menu_top());
             } else {
                 for line in lines {
                     let _ = self.ui.menu.remove(line);
@@ -2274,7 +2345,7 @@ impl App {
         let need_access = self.tap.is_none();
         if need_access != self.ui.access_shown {
             if need_access {
-                let at = if ps5 { 8 } else { 5 };
+                let at = menu_top() + if ps5 { 8 } else { 5 };
                 let _ = self.ui.menu.insert(&self.ui.access_item, at);
             } else {
                 let _ = self.ui.menu.remove(&self.ui.access_item);
@@ -2334,5 +2405,25 @@ impl App {
         let _ = self
             .tray
             .set_tooltip(Some(format!("Hotswitch: {}", self.mode.label())));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_heartbeat_from_the_old_receiver_cant_reconnect() {
+        let generation = Mutex::new(0);
+        let connected = AtomicBool::new(true);
+        // The heartbeat thread received a packet for generation 0, then the address changed.
+        start_new_receiver(&generation, &connected);
+        let published =
+            publish_if_current(&generation, 0, || connected.store(true, Ordering::SeqCst));
+        assert!(!published);
+        assert!(!connected.load(Ordering::SeqCst));
+        // A heartbeat for the new address does publish.
+        assert!(publish_if_current(&generation, 1, || connected.store(true, Ordering::SeqCst)));
+        assert!(connected.load(Ordering::SeqCst));
     }
 }

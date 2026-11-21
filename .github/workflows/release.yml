@@ -48,8 +48,12 @@ jobs:
           codesign -s "Hotswitch" -f --options runtime --entitlements "$entitlements" target/release/hotswitch-sender
           codesign -s "Hotswitch" -f --options runtime --entitlements "$entitlements" "$RUNNER_TEMP/macos-bundle/Hotswitch.app"
           codesign --verify --strict "$RUNNER_TEMP/macos-bundle/Hotswitch.app"
-          codesign -dv --entitlements - "$RUNNER_TEMP/macos-bundle/Hotswitch.app" 2>&1 | grep -E "flags=|audio-input"
-          codesign -dv "$RUNNER_TEMP/macos-bundle/Hotswitch.app" 2>&1 | grep -q "(runtime)"
+          # Fail unless both artifacts have hardened runtime and audio-input set to true.
+          for artifact in target/release/hotswitch-sender "$RUNNER_TEMP/macos-bundle/Hotswitch.app"; do
+            codesign -dv "$artifact" 2>&1 | grep -qE "flags=0x[0-9a-f]+\([^)]*runtime"
+            codesign -d --entitlements - --xml "$artifact" > "$RUNNER_TEMP/entitlements.plist"
+            test "$(/usr/libexec/PlistBuddy -c "Print :com.apple.security.device.audio-input" "$RUNNER_TEMP/entitlements.plist")" = true
+          done
       - run: |
           mkdir -p "$RUNNER_TEMP/macos-release"
           cp target/release/hotswitch-sender "$RUNNER_TEMP/macos-release/"

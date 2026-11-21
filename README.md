@@ -105,7 +105,13 @@ DDC rules:
 - Before every I2C transaction the display layout is checked again; any change stops the operation.
 - A read is at most two tries, 250 ms apart. A write is sent once. Operations are at least a second apart, queued switches collapse into the latest, and one lock file serializes DDC across the app, the CLI and hooks. Nothing polls the monitor.
 
-`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc get <vcp> [serial]` and `ddc set <vcp> <value> [serial]` follow the same rules. `HOTSWITCH_DDC_DRY_RUN=1` keeps every rule but simulates the monitors' inputs instead of sending I2C, which is useful for trying modes and hand-back without touching hardware.
+`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc get <vcp> [serial]` and `ddc set <vcp> <value> [serial]` follow the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.
+
+A dry run (`open --env HOTSWITCH_DRY_RUN=1 Hotswitch.app`) tries modes and hand-back without touching hardware:
+- no DDC service is ever opened, and monitor inputs are simulated in a file;
+- hooks don't run, and the login item isn't touched;
+- settings, the hand-back record and the log are kept apart, under `Application Support/Hotswitch/dry-run/` and `hotswitch-sender-dry-run.log`;
+- the menu bar shows "DRY RUN", and the menu starts with "Dry run: monitors simulated, hooks off".
 
 ### macOS hooks
 

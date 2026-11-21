@@ -11,9 +11,11 @@
 //! - one DDC operation at a time across processes (a lock file); a read is at most two tries
 //!   with a pause, a write is sent once.
 //!
-//! `HOTSWITCH_DDC_DRY_RUN=1` keeps every rule above but simulates the monitors' inputs
-//! instead of sending I2C, so mode and hand-back logic can be exercised without hardware.
+//! In a dry run (`HOTSWITCH_DRY_RUN=1`) every rule above still applies, but no DDC service
+//! is ever opened: monitors' inputs are simulated in a file in the dry run's own folder, so
+//! they survive a restart and mode and hand-back logic can be tried without hardware.
 
+use crate::settings::{dry_run, support_dir, write_atomically};
 use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
@@ -24,7 +26,6 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::fs::File;
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -272,15 +273,17 @@ impl Target {
             ));
         }
         let mut service: CFTypeRef = ptr::null();
-        unsafe {
-            for_each_service(c"DCPAVServiceProxy", |entry| {
-                if service.is_null() && layout.proxy_identity(entry) == Some(identity) {
-                    service = IOAVServiceCreateWithService(ptr::null(), entry);
-                }
-            });
-        }
-        if service.is_null() && !dry_run() {
-            return Err(format!("{} has no DDC service", identity.name));
+        if !dry_run() {
+            unsafe {
+                for_each_service(c"DCPAVServiceProxy", |entry| {
+                    if service.is_null() && layout.proxy_identity(entry) == Some(identity) {
+                        service = IOAVServiceCreateWithService(ptr::null(), entry);
+                    }
+                });
+            }
+            if service.is_null() {
+                return Err(format!("{} has no DDC service", identity.name));
+            }
         }
         Ok(Target {
             identity: identity.clone(),
@@ -307,11 +310,11 @@ impl Target {
                 "ddc dry run: {} vcp {vcp:#04x} = {value}",
                 self.identity.label()
             );
-            simulated()
-                .lock()
-                .unwrap()
-                .insert(self.identity.serial.clone(), value);
-            return Ok(());
+            let mut inputs = simulated_inputs();
+            inputs.insert(self.identity.serial.clone(), value);
+            let json = serde_json::to_vec_pretty(&inputs).map_err(|e| e.to_string())?;
+            return write_atomically(&support_dir().join("simulated-inputs.json"), &json)
+                .map_err(|e| format!("simulated write: {e}"));
         }
         if unsafe { self.send(&set_request(vcp, value)) } == 0 {
             Ok(())
@@ -324,11 +327,10 @@ impl Target {
     pub fn read(&self, vcp: u8) -> Result<u16, String> {
         if dry_run() {
             self.guard()?;
-            let value = *simulated()
-                .lock()
-                .unwrap()
-                .entry(self.identity.serial.clone())
-                .or_insert(0x0F);
+            let value = simulated_inputs()
+                .get(&self.identity.serial)
+                .copied()
+                .unwrap_or(0x0F);
             eprintln!(
                 "ddc dry run: {} vcp {vcp:#04x} is {value}",
                 self.identity.label()
@@ -359,6 +361,9 @@ impl Target {
     }
 
     unsafe fn send(&self, packet: &[u8]) -> i32 {
+        if self.service.is_null() {
+            return -1;
+        }
         IOAVServiceWriteI2C(
             self.service,
             CHIP,
@@ -399,19 +404,17 @@ fn reply_value(reply: &[u8; 11], vcp: u8) -> Option<u16> {
     ok.then(|| u16::from_be_bytes([reply[8], reply[9]]))
 }
 
-fn dry_run() -> bool {
-    static DRY: OnceLock<bool> = OnceLock::new();
-    *DRY.get_or_init(|| std::env::var("HOTSWITCH_DDC_DRY_RUN").is_ok_and(|v| v == "1"))
-}
-
-fn simulated() -> &'static Mutex<HashMap<String, u16>> {
-    static INPUTS: OnceLock<Mutex<HashMap<String, u16>>> = OnceLock::new();
-    INPUTS.get_or_init(Default::default)
+/// Simulated inputs by serial (dry run only). A monitor not yet in the file shows 15.
+fn simulated_inputs() -> HashMap<String, u16> {
+    std::fs::read(support_dir().join("simulated-inputs.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
 }
 
 /// One DDC operation at a time, across the app, the CLI and hooks.
 fn lock() -> Result<File, String> {
-    let dir = crate::settings::support_dir();
+    let dir = support_dir();
     let _ = std::fs::create_dir_all(&dir);
     let file = File::options()
         .create(true)

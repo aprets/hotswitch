@@ -127,38 +127,43 @@ impl InputPort for Target {
 
 type SaveClaim<'a> = dyn FnMut(Option<&Claim>) -> std::io::Result<()> + 'a;
 
-/// Read the input; if that fails, stop. Save the claim; if that fails, stop. Only then switch.
-/// Returns the report and the claim now held, if any.
+/// Read the input; if that fails, stop. If the request was withdrawn meanwhile, stop. Save the
+/// claim; if that fails, stop. Only then switch. `existing` is a claim already held for this
+/// monitor and input: it is trusted only once the read shows the monitor on that input.
+/// Returns the report (`None` when withdrawn) and the claim now held.
 pub fn take_steps(
     port: &mut dyn InputPort,
     save: &mut SaveClaim,
+    still_wanted: &mut dyn FnMut() -> bool,
     identity: Identity,
     input: u16,
-) -> (Report, Option<Claim>) {
+    existing: Option<Claim>,
+) -> (Option<Report>, Option<Claim>) {
     let name = identity.name.clone();
     let current = match port.read_input() {
         Ok(v) => v,
         Err(e) => {
-            return (
-                Report::Refused(format!("{e}, so {name} wasn't switched")),
-                None,
-            )
+            let reason = format!("{e}, so {name} wasn't switched");
+            return (Some(Report::Refused(reason)), existing);
         }
     };
+    if !still_wanted() {
+        return (None, existing);
+    }
     let claim = match plan_take(identity, current, input) {
-        TakeStep::AlreadyThere => return (Report::Holding { name, input }, None),
+        TakeStep::AlreadyThere => return (Some(Report::Holding { name, input }), existing),
         TakeStep::Switch(claim) => claim,
     };
     if let Err(e) = save(Some(&claim)) {
         let reason = format!("Couldn't save the hand-back record ({e}), so {name} wasn't switched");
-        return (Report::Refused(reason), None);
+        return (Some(Report::Refused(reason)), existing);
     }
     eprintln!("monitor: saved claim {claim:?}, switching");
     match port.write_input(input) {
         // The claim stays: hand-back reads first and leaves the monitor alone if this write
         // never landed.
-        Err(e) => (Report::Refused(e), Some(claim)),
-        Ok(()) => (Report::Holding { name, input }, Some(claim)),
+        Err(e) => (Some(Report::Refused(e)), Some(claim)),
+        Ok(()) => (Some(Report::Holding { name, input }), Some(claim)),
     }
 }
 
@@ -196,6 +201,25 @@ pub fn hand_back_steps(
     (Report::Released { name, input: set }, None)
 }
 
+/// How the worker finds and opens monitors: the hardware, or a fake in tests.
+pub trait Monitors: Send {
+    fn resolve(&mut self, wanted: Option<&str>) -> Result<Identity, String>;
+    fn open(&mut self, identity: &Identity) -> Result<Box<dyn InputPort>, String>;
+}
+
+struct Hardware;
+
+impl Monitors for Hardware {
+    fn resolve(&mut self, wanted: Option<&str>) -> Result<Identity, String> {
+        // Registry only: no DDC until the target is settled.
+        ddc::resolve(&Layout::read().targetable(), wanted)
+    }
+
+    fn open(&mut self, identity: &Identity) -> Result<Box<dyn InputPort>, String> {
+        Ok(Box::new(Target::open(identity)?))
+    }
+}
+
 pub fn claim_path(dir: &Path) -> PathBuf {
     dir.join("monitor-claim.json")
 }
@@ -226,156 +250,213 @@ fn save_claim(dir: &Path, claim: Option<&Claim>) -> std::io::Result<()> {
 
 pub fn spawn(dir: PathBuf, report: impl Fn(Report) + Send + 'static) -> Sender<Job> {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+    thread::spawn(move || Worker::new(dir, Box::new(Hardware), rx, Box::new(report)).run());
+    tx
+}
+
+struct Worker {
+    dir: PathBuf,
+    monitors: Box<dyn Monitors>,
+    rx: Receiver<Job>,
+    report: Box<dyn Fn(Report) + Send>,
+    claim: Option<Claim>,
+    want: Want,
+    /// The request last carried out. A request equal to it isn't repeated.
+    done: Option<Want>,
+    /// A wake or display change asked to retry an owed hand-back.
+    event: bool,
+    flushes: Vec<Sender<()>>,
+    last_ddc: Option<Instant>,
+}
+
+impl Worker {
+    fn new(
+        dir: PathBuf,
+        monitors: Box<dyn Monitors>,
+        rx: Receiver<Job>,
+        report: Box<dyn Fn(Report) + Send>,
+    ) -> Self {
         let claim = load_claim(&dir);
         if let Some(c) = &claim {
             eprintln!("monitor: a hand-back is owed from before: {c:?}");
         }
         Worker {
             dir,
+            monitors,
+            rx,
+            report,
+            // A claim left by a crash is handed back first; the app starts in Mac mode.
+            event: claim.is_some(),
             claim,
             want: Want::Release,
+            done: Some(Want::Release),
+            flushes: Vec::new(),
             last_ddc: None,
-            report: Box::new(report),
         }
-        .run(rx)
-    });
-    tx
-}
+    }
 
-struct Worker {
-    dir: PathBuf,
-    claim: Option<Claim>,
-    want: Want,
-    last_ddc: Option<Instant>,
-    report: Box<dyn Fn(Report) + Send>,
-}
-
-impl Worker {
-    fn run(mut self, rx: Receiver<Job>) {
-        // A claim left by a crash is handed back first; the app starts in Mac mode.
-        let mut changed = false;
-        let mut event = self.claim.is_some();
+    fn run(mut self) {
         loop {
-            let mut flushes = Vec::new();
-            if !changed && !event {
-                match rx.recv() {
-                    Ok(job) => self.take_job(job, &mut changed, &mut event, &mut flushes),
+            if !self.needs_work() {
+                for done in self.flushes.drain(..) {
+                    let _ = done.send(());
+                }
+                match self.rx.recv() {
+                    Ok(job) => self.take_job(job),
                     Err(_) => return,
                 }
+                self.drain();
+                if !self.needs_work() {
+                    continue;
+                }
             }
-            // Switches that pile up collapse into the latest.
-            while let Ok(job) = rx.try_recv() {
-                self.take_job(job, &mut changed, &mut event, &mut flushes);
-            }
-            if changed || (event && self.want == Want::Release && self.claim.is_some()) {
-                self.reconcile();
-            }
-            changed = false;
-            event = false;
-            for f in flushes {
-                let _ = f.send(());
+            // Wait out the spacing first, then act on whatever is wanted by the end of it.
+            self.cool_down();
+            self.drain();
+            if self.needs_work() {
+                let wanted = self.want.clone();
+                self.event = false;
+                if self.reconcile(&wanted) {
+                    self.done = Some(wanted);
+                }
             }
         }
     }
 
-    fn take_job(
-        &mut self,
-        job: Job,
-        changed: &mut bool,
-        event: &mut bool,
-        flushes: &mut Vec<Sender<()>>,
-    ) {
+    fn needs_work(&self) -> bool {
+        self.done.as_ref() != Some(&self.want)
+            || (self.event && self.want == Want::Release && self.claim.is_some())
+    }
+
+    fn take_job(&mut self, job: Job) {
         match job {
-            Job::Want(want) => {
-                *changed |= want != self.want;
-                self.want = want;
-            }
-            Job::Reconcile => *event = true,
-            Job::Flush(done) => flushes.push(done),
+            Job::Want(want) => self.want = want,
+            Job::Reconcile => self.event = true,
+            Job::Flush(done) => self.flushes.push(done),
         }
     }
 
-    fn reconcile(&mut self) {
-        match self.want.clone() {
-            Want::Release => {
-                if let Some(claim) = self.claim.clone() {
-                    let report = self.hand_back(claim);
-                    (self.report)(report);
-                }
-            }
-            Want::Hold { monitor, input } => {
-                if let Some(claim) = self.claim.clone() {
-                    if claim_satisfies(&claim, monitor.as_deref(), input) {
-                        (self.report)(Report::Holding {
-                            name: claim.monitor.name,
-                            input,
-                        });
-                        return;
-                    }
-                    // An older claim on another monitor or input goes back first.
-                    let report = self.hand_back(claim);
-                    if self.claim.is_some() {
-                        (self.report)(report);
-                        return;
-                    }
-                }
-                let report = self.take(monitor.as_deref(), input);
-                (self.report)(report);
-            }
+    fn drain(&mut self) {
+        while let Ok(job) = self.rx.try_recv() {
+            self.take_job(job);
         }
     }
 
-    fn take(&mut self, monitor: Option<&str>, input: u16) -> Report {
-        // Registry only: no DDC until the target is settled.
-        let identity = match ddc::resolve(&Layout::read().targetable(), monitor) {
-            Ok(id) => id,
-            Err(e) => return Report::Refused(e),
-        };
-        let mut target = match self.open(&identity) {
-            Ok(t) => t,
-            Err(e) => return Report::Refused(e),
-        };
-        let dir = self.dir.clone();
-        let (report, claim) =
-            take_steps(&mut target, &mut |c| save_claim(&dir, c), identity, input);
-        self.last_ddc = Some(Instant::now());
-        if claim.is_some() {
-            self.claim = claim;
-        }
-        report
+    /// True once the request being carried out has been replaced by a newer one.
+    fn superseded(&mut self, wanted: &Want) -> bool {
+        self.drain();
+        self.want != *wanted
     }
 
-    /// Returns `Owed` and keeps the claim whenever it can't be sure the monitor is free.
-    fn hand_back(&mut self, claim: Claim) -> Report {
-        let mut target = match self.open(&claim.monitor) {
-            Ok(t) => t,
-            Err(e) => {
-                return Report::Owed(format!(
-                    "{e}. {} will be handed back later",
-                    claim.monitor.name
-                ))
-            }
-        };
-        let dir = self.dir.clone();
-        let (report, kept) = hand_back_steps(&mut target, &mut |c| save_claim(&dir, c), claim);
-        self.last_ddc = Some(Instant::now());
-        self.claim = kept;
-        report
-    }
-
-    /// Wait out the spacing, then open the target (which also takes the cross-process lock).
-    fn open(&mut self, identity: &Identity) -> Result<Target, String> {
+    fn cool_down(&self) {
         if let Some(last) = self.last_ddc {
             thread::sleep(SPACING.saturating_sub(last.elapsed()));
         }
-        Target::open(identity)
+    }
+
+    /// Carry out `wanted`. False when a newer request replaced it before any write.
+    fn reconcile(&mut self, wanted: &Want) -> bool {
+        match wanted.clone() {
+            Want::Release => match self.claim.clone() {
+                None => true,
+                Some(claim) => self.hand_back(claim, wanted),
+            },
+            Want::Hold { monitor, input } => {
+                let existing = match self.claim.clone() {
+                    Some(c) if claim_satisfies(&c, monitor.as_deref(), input) => Some(c),
+                    Some(c) => {
+                        // An older claim on another monitor or input goes back first.
+                        if !self.hand_back(c, wanted) {
+                            return false;
+                        }
+                        if self.claim.is_some() {
+                            return true;
+                        }
+                        None
+                    }
+                    None => None,
+                };
+                self.take(monitor.as_deref(), input, existing, wanted)
+            }
+        }
+    }
+
+    fn take(
+        &mut self,
+        monitor: Option<&str>,
+        input: u16,
+        existing: Option<Claim>,
+        wanted: &Want,
+    ) -> bool {
+        let identity = match &existing {
+            Some(c) => Ok(c.monitor.clone()),
+            None => self.monitors.resolve(monitor),
+        };
+        let mut port = match identity.clone().and_then(|id| self.open(&id)) {
+            Ok(port) => port,
+            Err(e) => {
+                (self.report)(Report::Refused(e));
+                return true;
+            }
+        };
+        // Waiting for the lock can take a while; the user may have moved on.
+        if self.superseded(wanted) {
+            return false;
+        }
+        let dir = self.dir.clone();
+        let (report, held) = take_steps(
+            port.as_mut(),
+            &mut |c| save_claim(&dir, c),
+            &mut || !self.superseded(wanted),
+            identity.expect("opened"),
+            input,
+            existing,
+        );
+        self.last_ddc = Some(Instant::now());
+        self.claim = held;
+        match report {
+            Some(report) => {
+                (self.report)(report);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Reports `Owed` and keeps the claim whenever it can't be sure the monitor is free.
+    fn hand_back(&mut self, claim: Claim, wanted: &Want) -> bool {
+        let mut port = match self.open(&claim.monitor) {
+            Ok(port) => port,
+            Err(e) => {
+                let name = &claim.monitor.name;
+                (self.report)(Report::Owed(format!(
+                    "{e}. {name} will be handed back later"
+                )));
+                return true;
+            }
+        };
+        if self.superseded(wanted) {
+            return false;
+        }
+        let dir = self.dir.clone();
+        let (report, kept) = hand_back_steps(port.as_mut(), &mut |c| save_claim(&dir, c), claim);
+        self.last_ddc = Some(Instant::now());
+        self.claim = kept;
+        (self.report)(report);
+        true
+    }
+
+    /// Wait out the spacing, then open the target (which also takes the cross-process lock).
+    fn open(&mut self, identity: &Identity) -> Result<Box<dyn InputPort>, String> {
+        self.cool_down();
+        self.monitors.open(identity)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn monitor() -> Identity {
         Identity {
@@ -449,8 +530,15 @@ mod tests {
     #[test]
     fn take_never_writes_after_a_failed_read() {
         let (mut port, log) = fake(Err("DDC read failed".into()), true);
-        let (report, held) = take_steps(&mut port, &mut store(&log, true), monitor(), 17);
-        assert!(matches!(report, Report::Refused(_)));
+        let (report, held) = take_steps(
+            &mut port,
+            &mut store(&log, true),
+            &mut || true,
+            monitor(),
+            17,
+            None,
+        );
+        assert!(matches!(report, Some(Report::Refused(_))));
         assert_eq!(held, None);
         assert_eq!(*log.borrow(), ["read"]);
     }
@@ -458,8 +546,15 @@ mod tests {
     #[test]
     fn take_saves_the_claim_before_switching() {
         let (mut port, log) = fake(Ok(15), true);
-        let (report, held) = take_steps(&mut port, &mut store(&log, true), monitor(), 17);
-        assert!(matches!(report, Report::Holding { input: 17, .. }));
+        let (report, held) = take_steps(
+            &mut port,
+            &mut store(&log, true),
+            &mut || true,
+            monitor(),
+            17,
+            None,
+        );
+        assert!(matches!(report, Some(Report::Holding { input: 17, .. })));
         assert_eq!(held, Some(claim()));
         assert_eq!(*log.borrow(), ["read", "save 15->17", "write 17"]);
     }
@@ -467,8 +562,15 @@ mod tests {
     #[test]
     fn take_never_writes_when_the_claim_cant_be_saved() {
         let (mut port, log) = fake(Ok(15), true);
-        let (report, held) = take_steps(&mut port, &mut store(&log, false), monitor(), 17);
-        assert!(matches!(report, Report::Refused(_)));
+        let (report, held) = take_steps(
+            &mut port,
+            &mut store(&log, false),
+            &mut || true,
+            monitor(),
+            17,
+            None,
+        );
+        assert!(matches!(report, Some(Report::Refused(_))));
         assert_eq!(held, None);
         assert_eq!(*log.borrow(), ["read", "save 15->17"]);
     }
@@ -476,7 +578,14 @@ mod tests {
     #[test]
     fn take_keeps_the_claim_when_the_write_fails() {
         let (mut port, log) = fake(Ok(15), false);
-        let (_, held) = take_steps(&mut port, &mut store(&log, true), monitor(), 17);
+        let (_, held) = take_steps(
+            &mut port,
+            &mut store(&log, true),
+            &mut || true,
+            monitor(),
+            17,
+            None,
+        );
         assert_eq!(held, Some(claim()));
         assert_eq!(*log.borrow(), ["read", "save 15->17", "write 17"]);
     }
@@ -484,8 +593,15 @@ mod tests {
     #[test]
     fn take_of_an_input_already_shown_claims_nothing() {
         let (mut port, log) = fake(Ok(17), true);
-        let (report, held) = take_steps(&mut port, &mut store(&log, true), monitor(), 17);
-        assert!(matches!(report, Report::Holding { .. }));
+        let (report, held) = take_steps(
+            &mut port,
+            &mut store(&log, true),
+            &mut || true,
+            monitor(),
+            17,
+            None,
+        );
+        assert!(matches!(report, Some(Report::Holding { .. })));
         assert_eq!(held, None);
         assert_eq!(*log.borrow(), ["read"]);
     }
@@ -530,6 +646,133 @@ mod tests {
         assert!(matches!(report, Report::Owed(_)));
         assert_eq!(kept, Some(claim()));
         assert_eq!(*log.borrow(), ["read", "write 15"]);
+    }
+
+    #[test]
+    fn take_stops_when_withdrawn_after_the_read() {
+        let (mut port, log) = fake(Ok(15), true);
+        let (report, held) = take_steps(
+            &mut port,
+            &mut store(&log, true),
+            &mut || false,
+            monitor(),
+            17,
+            None,
+        );
+        assert!(report.is_none());
+        assert_eq!(held, None);
+        assert_eq!(*log.borrow(), ["read"]);
+    }
+
+    #[test]
+    fn an_owed_claim_is_checked_not_trusted() {
+        // Still on our input: holding, and the original obligation stays.
+        let (mut port, log) = fake(Ok(17), true);
+        let (report, held) = take_steps(
+            &mut port,
+            &mut store(&log, true),
+            &mut || true,
+            monitor(),
+            17,
+            Some(claim()),
+        );
+        assert!(matches!(report, Some(Report::Holding { .. })));
+        assert_eq!(held, Some(claim()));
+        assert_eq!(*log.borrow(), ["read"]);
+        // Back on the original (the earlier write never landed): switch again.
+        let (mut port, log) = fake(Ok(15), true);
+        let (_, held) = take_steps(
+            &mut port,
+            &mut store(&log, true),
+            &mut || true,
+            monitor(),
+            17,
+            Some(claim()),
+        );
+        assert_eq!(held, Some(claim()));
+        assert_eq!(*log.borrow(), ["read", "save 15->17", "write 17"]);
+    }
+
+    /// The real worker loop against a fake monitor that remembers its input.
+    struct FakeMonitors {
+        log: Arc<Mutex<Vec<String>>>,
+        input: Arc<Mutex<u16>>,
+    }
+
+    struct FakePort {
+        log: Arc<Mutex<Vec<String>>>,
+        input: Arc<Mutex<u16>>,
+    }
+
+    impl InputPort for FakePort {
+        fn read_input(&mut self) -> Result<u16, String> {
+            self.log.lock().unwrap().push("read".into());
+            Ok(*self.input.lock().unwrap())
+        }
+        fn write_input(&mut self, value: u16) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!("write {value}"));
+            *self.input.lock().unwrap() = value;
+            Ok(())
+        }
+    }
+
+    impl Monitors for FakeMonitors {
+        fn resolve(&mut self, _wanted: Option<&str>) -> Result<Identity, String> {
+            Ok(monitor())
+        }
+        fn open(&mut self, _identity: &Identity) -> Result<Box<dyn InputPort>, String> {
+            Ok(Box::new(FakePort {
+                log: self.log.clone(),
+                input: self.input.clone(),
+            }))
+        }
+    }
+
+    fn worker(name: &str, input: u16) -> (Worker, Sender<Job>, Arc<Mutex<Vec<String>>>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hotswitch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let monitors = FakeMonitors {
+            log: log.clone(),
+            input: Arc::new(Mutex::new(input)),
+        };
+        let (tx, rx) = mpsc::channel();
+        let w = Worker::new(dir.clone(), Box::new(monitors), rx, Box::new(|_| {}));
+        (w, tx, log, dir)
+    }
+
+    #[test]
+    fn a_release_queued_during_the_cool_down_wins() {
+        let (mut w, tx, log, dir) = worker("cooldown", 15);
+        w.last_ddc = Some(Instant::now()); // as if a DDC job just finished
+        tx.send(Job::Want(Want::Hold {
+            monitor: None,
+            input: 17,
+        }))
+        .unwrap();
+        let runner = thread::spawn(move || w.run());
+        thread::sleep(Duration::from_millis(200));
+        tx.send(Job::Want(Want::Release)).unwrap();
+        drop(tx);
+        runner.join().unwrap();
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_owed_claim_is_read_before_holding() {
+        let (mut w, tx, log, dir) = worker("owed", 15);
+        // A failed hand-back kept this claim, but the monitor is on 15 again.
+        w.claim = Some(claim());
+        tx.send(Job::Want(Want::Hold {
+            monitor: None,
+            input: 17,
+        }))
+        .unwrap();
+        drop(tx);
+        w.run();
+        assert_eq!(*log.lock().unwrap(), ["read", "write 17"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

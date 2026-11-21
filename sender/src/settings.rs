@@ -248,6 +248,8 @@ impl Settings {
                 eprintln!("settings: ignoring unreadable {}: {e}", path.display());
                 Settings::default()
             }),
+            // A dry run starts from a copy of the real settings; its edits stay in its folder.
+            Err(_) if dry_run() && dir != real_support_dir() => Settings::load(&real_support_dir()),
             Err(_) => {
                 // First run of this version: keep the receiver address from the old file.
                 let receiver = std::fs::read_to_string(dir.join("receiver-address.txt"))
@@ -267,12 +269,28 @@ impl Settings {
     }
 }
 
-/// `~/Library/Application Support/Hotswitch`.
-pub fn support_dir() -> PathBuf {
+/// `HOTSWITCH_DRY_RUN=1`: monitors are simulated, hooks and login-item changes are skipped,
+/// and all state lives in its own folder, so a dry run can't touch hardware or real state.
+pub fn dry_run() -> bool {
+    static DRY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DRY.get_or_init(|| std::env::var("HOTSWITCH_DRY_RUN").is_ok_and(|v| v == "1"))
+}
+
+/// `~/Library/Application Support/Hotswitch`, whatever the run.
+pub fn real_support_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
         .join("Library/Application Support")
         .join("Hotswitch")
+}
+
+/// Where this run keeps its state: settings, the hand-back claim, the DDC lock.
+pub fn support_dir() -> PathBuf {
+    if dry_run() {
+        real_support_dir().join("dry-run")
+    } else {
+        real_support_dir()
+    }
 }
 
 /// Replace `path` in one step: write a temporary file next to it, flush it to disk, rename.
