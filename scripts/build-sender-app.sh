@@ -3,6 +3,7 @@ set -euo pipefail
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
   echo "usage: $0 <sender-binary> <version> [output-dir]" >&2
+  echo "Signs with \$HOTSWITCH_SIGN_IDENTITY, else the first Apple Development identity, else not at all." >&2
   exit 1
 fi
 
@@ -14,7 +15,8 @@ app_root="$output_dir/Hotswitch.app"
 contents_dir="$app_root/Contents"
 macos_dir="$contents_dir/MacOS"
 resources_dir="$contents_dir/Resources"
-icon_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sender/assets/app-icon-1024.png"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+icon_source="$repo_root/sender/assets/app-icon-1024.png"
 
 rm -rf "$app_root"
 mkdir -p "$macos_dir" "$resources_dir"
@@ -70,10 +72,29 @@ cat > "$contents_dir/Info.plist" <<EOF
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>PS5 mode plays the PS5's sound, which reaches the Mac through the dock's microphone input.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>
 </plist>
 EOF
+
+# A stable signature keeps the Accessibility and Microphone permissions across rebuilds.
+# An Apple Development certificate only runs on Macs that trust it; giving the app to
+# anyone else needs a Developer ID certificate and notarization.
+identity="${HOTSWITCH_SIGN_IDENTITY:-}"
+if [ -z "$identity" ] && command -v security >/dev/null; then
+  identity="$(security find-identity -v -p codesigning | sed -n 's/.*"\(Apple Development: .*\)"/\1/p' | head -1)"
+fi
+if [ -n "$identity" ]; then
+  codesign --force --options runtime --timestamp=none \
+    --entitlements "$repo_root/sender/macos/Hotswitch.entitlements" \
+    --sign "$identity" "$app_root"
+  codesign --verify --strict "$app_root"
+  echo "signed with $identity"
+else
+  echo "not signed: no HOTSWITCH_SIGN_IDENTITY and no Apple Development identity"
+fi
 
 echo "created $app_root"

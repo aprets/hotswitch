@@ -1,4 +1,12 @@
-use core_foundation::{base::TCFType, boolean::CFBoolean, runloop::CFRunLoop, string::CFString};
+mod ddc;
+mod passthrough;
+mod settings;
+mod settings_window;
+
+use core_foundation::{
+    base::TCFType, boolean::CFBoolean, dictionary::CFDictionary, runloop::CFRunLoop,
+    string::CFString,
+};
 use core_graphics::{
     display::CGDisplay,
     event::{
@@ -16,32 +24,38 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSTextField, NSWorkspace,
-    NSWorkspaceScreensDidSleepNotification, NSWorkspaceSessionDidResignActiveNotification,
-    NSWorkspaceWillSleepNotification,
+    NSWorkspace, NSWorkspaceScreensDidSleepNotification,
+    NSWorkspaceSessionDidResignActiveNotification, NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
     ns_string, NSActivityOptions, NSDistributedNotificationCenter, NSNotification,
-    NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize,
+    NSNotificationCenter, NSObject, NSObjectProtocol, NSProcessInfo,
 };
+use passthrough::{MicAccess, Passthrough};
+use settings::{
+    parse_receiver_address, AudioRoute, Hotkey, Mode, Settings, KEY_DELETE, KEY_ESCAPE,
+};
+use settings_window::{Action, SettingsWindow};
 use std::{
     collections::HashSet,
     ffi::c_void,
-    net::SocketAddr,
     net::UdpSocket,
     path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::SystemTime,
     time::{Duration, Instant},
 };
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon, TrayIconBuilder,
+    menu::{
+        accelerator::{Accelerator, Code, Modifiers},
+        CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem,
+    },
+    Icon, TrayIcon, TrayIconBuilder,
 };
 
 extern "C" {
@@ -57,17 +71,24 @@ extern "C" {
     fn CGEventSourceSetLocalEventsSuppressionInterval(event_source: *mut c_void, seconds: f64);
 }
 
-const HOTKEY_KEYCODE: u16 = 0x35; // kVK_Escape
-const HOTKEY_REQUIRES_CTRL: bool = true;
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+}
+
 const AUDIO_BUFFER_CANDIDATES: [u32; 2] = [128, 256];
 const AUDIO_QUEUE_CAPACITY: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 12; // ~83ms
 const AUDIO_TARGET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 66; // ~15ms
 const AUDIO_BIAS_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 40; // ~25ms
 const AUDIO_RESET_FILL: usize = (audio::SAMPLE_RATE as usize * audio::CHANNELS as usize) / 20; // ~50ms
 const AUDIO_SEQ_RESET_STALE_PACKETS: u32 = 16;
-const DEFAULT_RECEIVER_PLACEHOLDER: &str = "10.0.0.100:24801";
-const RECEIVER_ADDRESS_KEY: &str = "receiver-address.txt";
 const MACOS_RELEASE_ASSET: &str = "hotswitch-sender-aarch64-apple-darwin.tar.gz";
+/// Device changes come in bursts (a dock rebooting); act once they settle.
+const AUDIO_SETTLE: Duration = Duration::from_secs(1);
+/// Least time between two DDC jobs. Monitors behind a dock can drop off when pushed.
+const DDC_SPACING: Duration = Duration::from_secs(1);
+/// Pause between reading a monitor's input and writing a new one.
+const DDC_STEP: Duration = Duration::from_millis(100);
 
 fn seq_is_newer(seq: u32, last: u32) -> bool {
     (seq.wrapping_sub(last) as i32) > 0
@@ -87,50 +108,33 @@ enum AppState {
     Capturing = 2,
 }
 
-impl AppState {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Connected,
-            2 => Self::Capturing,
-            _ => Self::Waiting,
-        }
-    }
-    fn tooltip(self) -> &'static str {
-        match self {
-            Self::Waiting => "Hotswitch — Waiting for receiver",
-            Self::Connected => "Hotswitch — Connected",
-            Self::Capturing => "Hotswitch — Capturing",
-        }
-    }
-    fn icon(self) -> (Icon, bool) {
-        match self {
-            Self::Waiting => (make_icon(0, 0, 0, false), true),
-            Self::Connected => (make_icon(0, 0, 0, true), true),
-            Self::Capturing => (make_icon(234, 179, 8, true), false),
-        }
-    }
-    fn status_text(self) -> &'static str {
-        match self {
-            Self::Waiting => "Waiting for receiver...",
-            Self::Connected => "Connected",
-            Self::Capturing => "Capturing",
-        }
-    }
-}
-
 #[derive(Debug)]
 enum UserEvent {
     StateChanged,
-    CaptureBlocked,
     ReleaseCapture(&'static str),
     UpdateAvailable(String),
     Menu(tray_icon::menu::MenuEvent),
+    /// A mode's shortcut, from the event tap.
+    Hotkey(Mode),
+    HotkeyRecorded(Mode, Recorded),
+    Monitor(MonitorResult),
+    Settings(Action),
+    /// Audio devices came or went, or the default output changed.
+    AudioDevicesChanged,
+}
+
+#[derive(Debug)]
+enum Recorded {
+    Set(Hotkey),
+    Clear,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum HookKind {
     ReceiverConnected,
     ReceiverDisconnected,
+    ModeChanged,
 }
 
 impl HookKind {
@@ -138,6 +142,7 @@ impl HookKind {
         match self {
             Self::ReceiverConnected => "on-receiver-connected",
             Self::ReceiverDisconnected => "on-receiver-disconnected",
+            Self::ModeChanged => "on-mode-changed",
         }
     }
 
@@ -145,6 +150,7 @@ impl HookKind {
         match self {
             Self::ReceiverConnected => "receiver-connected",
             Self::ReceiverDisconnected => "receiver-disconnected",
+            Self::ModeChanged => "mode-changed",
         }
     }
 }
@@ -331,6 +337,34 @@ fn disengage_capture(
     }
 
     true
+}
+
+fn engage_capture(
+    cursor_pos: CGPoint,
+    capturing: &AtomicBool,
+    capture_anchor: &Mutex<Option<CGPoint>>,
+    accum_dx: &Mutex<f64>,
+    accum_dy: &Mutex<f64>,
+) {
+    capturing.store(true, Ordering::SeqCst);
+    eprintln!("capture started: anchor={cursor_pos:?}");
+    *capture_anchor.lock().unwrap() = Some(cursor_pos);
+    let associate_result = unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
+    eprintln!("cursor capture: associate result={associate_result}");
+    let hide_result = CGDisplay::hide_cursor(&CGDisplay::main());
+    eprintln!("cursor capture: hide result={hide_result:?}");
+    let warp_result = CGDisplay::warp_mouse_cursor_position(cursor_pos);
+    eprintln!("cursor capture: warp result={warp_result:?}");
+    *accum_dx.lock().unwrap() = 0.0;
+    *accum_dy.lock().unwrap() = 0.0;
+}
+
+fn cursor_position() -> CGPoint {
+    CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        .ok()
+        .and_then(|source| CGEvent::new(source).ok())
+        .map(|event| event.location())
+        .unwrap_or(CGPoint::new(0.0, 0.0))
 }
 
 enum UpdateOutcome {
@@ -550,120 +584,6 @@ fn app_support_dir() -> PathBuf {
         .join("Hotswitch")
 }
 
-fn receiver_address_path() -> PathBuf {
-    app_support_dir().join(RECEIVER_ADDRESS_KEY)
-}
-
-fn parse_receiver_address(value: &str) -> Result<String, &'static str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("Enter the Windows receiver address in IP:port form.");
-    }
-
-    trimmed
-        .parse::<SocketAddr>()
-        .map(|addr| addr.to_string())
-        .map_err(|_| "Use a valid receiver address like 10.0.0.209:24801.")
-}
-
-fn load_receiver_address() -> Option<String> {
-    let path = receiver_address_path();
-    let raw = std::fs::read_to_string(&path).ok()?;
-    match parse_receiver_address(&raw) {
-        Ok(addr) => Some(addr),
-        Err(err) => {
-            eprintln!(
-                "ignoring invalid receiver address at {}: {err}",
-                path.display()
-            );
-            None
-        }
-    }
-}
-
-fn save_receiver_address(target_addr: &str) -> bool {
-    let path = receiver_address_path();
-    if let Some(parent) = path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "failed to create receiver address directory {}: {err}",
-                parent.display()
-            );
-            return false;
-        }
-    }
-
-    match std::fs::write(&path, format!("{target_addr}\n")) {
-        Ok(()) => true,
-        Err(err) => {
-            eprintln!(
-                "failed to save receiver address to {}: {err}",
-                path.display()
-            );
-            false
-        }
-    }
-}
-
-fn prompt_for_receiver_address(current_value: Option<&str>) -> Option<String> {
-    let mtm = MainThreadMarker::new().expect("sender must prompt on the main thread");
-    let mut next_value = current_value.unwrap_or_default().to_string();
-    let mut error_message = None::<&'static str>;
-
-    loop {
-        let alert = NSAlert::new(mtm);
-        alert.setMessageText(ns_string!("Receiver Address"));
-        let info = match error_message {
-            Some(message) => message,
-            None => "Enter the Windows receiver address in IP:port form.",
-        };
-        let informative_text = format!("{info}\n\nExample: {DEFAULT_RECEIVER_PLACEHOLDER}");
-        let informative = objc2_foundation::NSString::from_str(&informative_text);
-        alert.setInformativeText(&informative);
-        alert.addButtonWithTitle(ns_string!("Save"));
-        alert.addButtonWithTitle(ns_string!("Cancel"));
-
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 24.0));
-        let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), frame);
-        field.setPlaceholderString(Some(ns_string!(DEFAULT_RECEIVER_PLACEHOLDER)));
-        let value = objc2_foundation::NSString::from_str(&next_value);
-        field.setStringValue(&value);
-        alert.setAccessoryView(Some(field.as_ref()));
-
-        if alert.runModal() != NSAlertFirstButtonReturn {
-            return None;
-        }
-
-        next_value = field.stringValue().to_string();
-        match parse_receiver_address(&next_value) {
-            Ok(addr) => return Some(addr),
-            Err(message) => error_message = Some(message),
-        }
-    }
-}
-
-fn resolve_receiver_address() -> Option<String> {
-    if let Some(arg_addr) = std::env::args().nth(1) {
-        match parse_receiver_address(&arg_addr) {
-            Ok(addr) => {
-                let _ = save_receiver_address(&addr);
-                return Some(addr);
-            }
-            Err(err) => eprintln!("ignoring invalid receiver address argument: {err}"),
-        }
-    }
-
-    if let Some(saved_addr) = load_receiver_address() {
-        return Some(saved_addr);
-    }
-
-    let addr = prompt_for_receiver_address(None)?;
-    if !save_receiver_address(&addr) {
-        eprintln!("receiver address prompt succeeded but saving failed");
-    }
-    Some(addr)
-}
-
 // --- Hooks ---
 
 fn hooks_dir() -> PathBuf {
@@ -674,7 +594,7 @@ fn hook_path(kind: HookKind) -> PathBuf {
     hooks_dir().join(kind.filename())
 }
 
-fn run_hook(kind: HookKind, wait: bool) {
+fn run_hook(kind: HookKind, wait: bool, args: &[&str]) {
     let path = hook_path(kind);
     let label = kind.label();
     let metadata = match std::fs::metadata(&path) {
@@ -698,10 +618,15 @@ fn run_hook(kind: HookKind, wait: bool) {
         }
     }
 
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let run = move || {
         let start = Instant::now();
-        eprintln!("hook {label}: running {}", path.display());
-        match std::process::Command::new(&path).status() {
+        eprintln!(
+            "hook {label}: running {} {}",
+            path.display(),
+            args.join(" ")
+        );
+        match std::process::Command::new(&path).args(&args).status() {
             Ok(status) => {
                 eprintln!(
                     "hook {label}: exited {status} in {}ms",
@@ -1108,24 +1033,413 @@ fn start_audio_playback() {
     });
 }
 
-fn main() {
-    let log_file_path = redirect_stdio_to_log();
+// --- Monitor input over DDC (on its own thread: reads and writes sleep) ---
 
-    let target_addr = match resolve_receiver_address() {
-        Some(addr) => addr,
-        None => return,
+#[derive(Debug)]
+enum MonitorResult {
+    Took {
+        name: String,
+        input: u16,
+        previous: Option<u16>,
+    },
+    Returned {
+        name: String,
+        input: u16,
+    },
+    Failed(String),
+}
+
+enum MonitorJob {
+    /// Show `input`, remembering what the monitor showed before.
+    Take { monitor: Option<String>, input: u16 },
+    /// Hand the monitor back if it still shows `from`. `fallback` is the saved input, for
+    /// when this run did not take it (after a crash).
+    Return {
+        monitor: Option<String>,
+        from: u16,
+        fallback: Option<u16>,
+        done: Option<mpsc::Sender<bool>>,
+    },
+}
+
+fn spawn_monitor_worker(proxy: EventLoopProxy<UserEvent>) -> mpsc::Sender<MonitorJob> {
+    let (tx, rx) = mpsc::channel::<MonitorJob>();
+    thread::spawn(move || {
+        let mut previous: Option<u16> = None;
+        let mut last = Instant::now()
+            .checked_sub(DDC_SPACING)
+            .unwrap_or_else(Instant::now);
+        while let Ok(mut job) = rx.recv() {
+            // Space DDC traffic out, and when switches pile up, act only on the latest one.
+            thread::sleep(DDC_SPACING.saturating_sub(last.elapsed()));
+            let mut waiting: Vec<mpsc::Sender<bool>> = Vec::new();
+            while let Ok(next) = rx.try_recv() {
+                if let MonitorJob::Return { done, .. } = &mut job {
+                    waiting.extend(done.take());
+                }
+                job = next;
+            }
+            let result = match job {
+                MonitorJob::Take { monitor, input } => take_monitor(monitor, input, &mut previous),
+                MonitorJob::Return {
+                    monitor,
+                    from,
+                    fallback,
+                    done,
+                } => {
+                    waiting.extend(done);
+                    let to = previous.take().or(fallback);
+                    return_monitor(monitor, from, to)
+                }
+            };
+            last = Instant::now();
+            match &result {
+                MonitorResult::Failed(e) => eprintln!("monitor: {e}"),
+                other => eprintln!("monitor: {other:?}"),
+            }
+            for done in waiting {
+                let _ = done.send(!matches!(result, MonitorResult::Failed(_)));
+            }
+            let _ = proxy.send_event(UserEvent::Monitor(result));
+        }
+    });
+    tx
+}
+
+fn take_monitor(monitor: Option<String>, input: u16, previous: &mut Option<u16>) -> MonitorResult {
+    let Some(m) = ddc::find(monitor.as_deref()) else {
+        return MonitorResult::Failed("Monitor not found".into());
     };
+    let current = m.get(ddc::VCP_INPUT).ok();
+    if current == Some(input) {
+        return MonitorResult::Took {
+            name: m.name.clone(),
+            input,
+            previous: None,
+        };
+    }
+    *previous = current;
+    thread::sleep(DDC_STEP);
+    match m.set(ddc::VCP_INPUT, input) {
+        Ok(()) => MonitorResult::Took {
+            name: m.name.clone(),
+            input,
+            previous: current.filter(|c| *c != input),
+        },
+        Err(e) => MonitorResult::Failed(e),
+    }
+}
+
+fn return_monitor(monitor: Option<String>, from: u16, to: Option<u16>) -> MonitorResult {
+    let Some(m) = ddc::find(monitor.as_deref()) else {
+        return MonitorResult::Failed("Monitor not found".into());
+    };
+    match m.get(ddc::VCP_INPUT) {
+        // Something else (a receiver hook, the monitor's buttons) already moved it on.
+        Ok(current) if current != from => {
+            return MonitorResult::Returned {
+                name: m.name.clone(),
+                input: current,
+            }
+        }
+        _ => {}
+    }
+    thread::sleep(DDC_STEP);
+    let Some(to) = to else {
+        return MonitorResult::Failed(format!(
+            "Don't know which input {} had before; switch it back on the monitor",
+            m.name
+        ));
+    };
+    match m.set(ddc::VCP_INPUT, to) {
+        Ok(()) => MonitorResult::Returned {
+            name: m.name.clone(),
+            input: to,
+        },
+        Err(e) => MonitorResult::Failed(e),
+    }
+}
+
+// --- Event tap ---
+
+#[derive(Clone)]
+struct TapContext {
+    capturing: Arc<AtomicBool>,
+    held_keys: Arc<Mutex<HashSet<u16>>>,
+    accum_dx: Arc<Mutex<f64>>,
+    accum_dy: Arc<Mutex<f64>>,
+    capture_anchor: Arc<Mutex<Option<CGPoint>>>,
+    socket: Arc<UdpSocket>,
+    hotkeys: Arc<Mutex<[Option<Hotkey>; 3]>>,
+    /// 0, or the index + 1 of the mode whose shortcut the settings window is recording.
+    recording: Arc<AtomicU8>,
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+/// The keyboard and mouse tap. Fails until Hotswitch has Accessibility access.
+fn create_event_tap(ctx: &TapContext) -> Option<CGEventTap<'static>> {
+    let ctx = ctx.clone();
+    let tap_port: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(ptr::null_mut()));
+    let tp = tap_port.clone();
+
+    let cg_events_of_interest: Vec<CGEventType> = vec![
+        CGEventType::LeftMouseDown,
+        CGEventType::LeftMouseUp,
+        CGEventType::RightMouseDown,
+        CGEventType::RightMouseUp,
+        CGEventType::OtherMouseDown,
+        CGEventType::OtherMouseUp,
+        CGEventType::MouseMoved,
+        CGEventType::LeftMouseDragged,
+        CGEventType::RightMouseDragged,
+        CGEventType::OtherMouseDragged,
+        CGEventType::ScrollWheel,
+        CGEventType::KeyDown,
+        CGEventType::KeyUp,
+        CGEventType::FlagsChanged,
+    ];
+
+    let event_tap_callback = move |_proxy: CGEventTapProxy,
+                                   event_type: CGEventType,
+                                   cg_ev: &CGEvent|
+          -> CallbackResult {
+        if matches!(
+            event_type,
+            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+        ) {
+            eprintln!("WARNING: CGEventTap was disabled, re-enabling");
+            let port = tp.load(Ordering::SeqCst);
+            if !port.is_null() {
+                unsafe {
+                    CGEventTapEnable(port, true);
+                }
+            }
+            return CallbackResult::Keep;
+        }
+
+        if matches!(event_type, CGEventType::KeyDown) {
+            let keycode = cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+            let hotkey = Hotkey::from_event(keycode, cg_ev.get_flags());
+
+            let recording = ctx.recording.load(Ordering::SeqCst) as usize;
+            if let Some(&mode) = recording.checked_sub(1).and_then(|i| Mode::ALL.get(i)) {
+                let plain = !(hotkey.ctrl || hotkey.option || hotkey.shift || hotkey.command);
+                let result = match keycode {
+                    KEY_ESCAPE if plain => Some(Recorded::Cancel),
+                    KEY_DELETE if plain => Some(Recorded::Clear),
+                    _ if hotkey.is_usable() => Some(Recorded::Set(hotkey)),
+                    _ => None,
+                };
+                if let Some(result) = result {
+                    ctx.recording.store(0, Ordering::SeqCst);
+                    let _ = ctx
+                        .proxy
+                        .send_event(UserEvent::HotkeyRecorded(mode, result));
+                }
+                return CallbackResult::Drop;
+            }
+
+            let mode = ctx
+                .hotkeys
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|h| h.as_ref() == Some(&hotkey));
+            if let Some(i) = mode {
+                if cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) == 0 {
+                    let _ = ctx.proxy.send_event(UserEvent::Hotkey(Mode::ALL[i]));
+                }
+                return CallbackResult::Drop;
+            }
+        }
+
+        if !ctx.capturing.load(Ordering::SeqCst) {
+            return CallbackResult::Keep;
+        }
+
+        let sock = &ctx.socket;
+        let mut buf = [0u8; 64];
+
+        match event_type {
+            CGEventType::MouseMoved
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged => {
+                let raw_dx = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                let raw_dy = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                let mut ax = ctx.accum_dx.lock().unwrap();
+                let mut ay = ctx.accum_dy.lock().unwrap();
+                *ax += raw_dx;
+                *ay += raw_dy;
+                let dx = (*ax).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                let dy = (*ay).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                *ax -= dx as f64;
+                *ay -= dy as f64;
+                if dx != 0 || dy != 0 {
+                    let evt = Event::MouseMove { dx, dy };
+                    let len = evt.to_bytes(&mut buf);
+                    let _ = sock.send(&buf[..len]);
+                    if let Some(anchor_pos) = *ctx.capture_anchor.lock().unwrap() {
+                        let _ = CGDisplay::warp_mouse_cursor_position(anchor_pos);
+                    }
+                }
+            }
+
+            CGEventType::LeftMouseDown
+            | CGEventType::LeftMouseUp
+            | CGEventType::RightMouseDown
+            | CGEventType::RightMouseUp
+            | CGEventType::OtherMouseDown
+            | CGEventType::OtherMouseUp => {
+                if let Some((button, pressed)) = map_mouse_button(&event_type, cg_ev) {
+                    let evt = Event::MouseButton { button, pressed };
+                    let len = evt.to_bytes(&mut buf);
+                    let _ = sock.send(&buf[..len]);
+                }
+            }
+
+            CGEventType::ScrollWheel => {
+                let v = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
+                    as i16;
+                let h = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
+                    as i16;
+                if v != 0 || h != 0 {
+                    let evt = Event::Scroll { dx: h, dy: v };
+                    let len = evt.to_bytes(&mut buf);
+                    let _ = sock.send(&buf[..len]);
+                }
+            }
+
+            CGEventType::KeyDown => {
+                let keycode =
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                ctx.held_keys.lock().unwrap().insert(keycode);
+                let evt = Event::Key {
+                    keycode,
+                    pressed: true,
+                };
+                let len = evt.to_bytes(&mut buf);
+                let _ = sock.send(&buf[..len]);
+            }
+            CGEventType::KeyUp => {
+                let keycode =
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                ctx.held_keys.lock().unwrap().remove(&keycode);
+                let evt = Event::Key {
+                    keycode,
+                    pressed: false,
+                };
+                let len = evt.to_bytes(&mut buf);
+                let _ = sock.send(&buf[..len]);
+            }
+            CGEventType::FlagsChanged => {
+                let keycode =
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                let flags = cg_ev.get_flags();
+                let mut k = ctx.held_keys.lock().unwrap();
+                let pressed = match keycode {
+                    0x38 | 0x3C => flags.contains(CGEventFlags::CGEventFlagShift),
+                    0x3B | 0x3E => flags.contains(CGEventFlags::CGEventFlagControl),
+                    0x3A | 0x3D => flags.contains(CGEventFlags::CGEventFlagAlternate),
+                    0x37 | 0x36 => flags.contains(CGEventFlags::CGEventFlagCommand),
+                    0x39 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
+                    _ => !k.contains(&keycode),
+                };
+                if pressed {
+                    k.insert(keycode);
+                } else {
+                    k.remove(&keycode);
+                }
+                drop(k);
+                let evt = Event::Key { keycode, pressed };
+                let len = evt.to_bytes(&mut buf);
+                let _ = sock.send(&buf[..len]);
+            }
+
+            _ => {}
+        }
+
+        CallbackResult::Drop
+    };
+
+    let tap = CGEventTap::new(
+        CGEventTapLocation::Session,
+        CGEventTapPlacement::HeadInsertEventTap,
+        CGEventTapOptions::Default,
+        cg_events_of_interest,
+        event_tap_callback,
+    )
+    .ok()?;
+
+    tap_port.store(
+        tap.mach_port().as_CFTypeRef() as *mut c_void,
+        Ordering::SeqCst,
+    );
+
+    let source = tap.mach_port().create_runloop_source(0).ok()?;
+    unsafe {
+        CFRunLoop::get_current()
+            .add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
+    }
+    Some(tap)
+}
+
+/// Shows macOS's "allow Accessibility" prompt.
+fn request_accessibility() {
+    let key = CFString::new("AXTrustedCheckOptionPrompt");
+    let options = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) };
+}
+
+fn store_state(
+    capturing: &AtomicBool,
+    receiver_connected: &AtomicBool,
+    app_state: &AtomicU8,
+) -> AppState {
+    let s = if capturing.load(Ordering::SeqCst) {
+        AppState::Capturing
+    } else if receiver_connected.load(Ordering::SeqCst) {
+        AppState::Connected
+    } else {
+        AppState::Waiting
+    };
+    app_state.store(s as u8, Ordering::SeqCst);
+    s
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("ddc") {
+        ddc::cli(&args[2..]);
+        return;
+    }
+
+    let log_file_path = redirect_stdio_to_log();
+    let support_dir = app_support_dir();
+    let mut settings = Settings::load(&support_dir);
+    if let Some(arg) = args.get(1) {
+        match parse_receiver_address(arg) {
+            Ok(addr) => settings.receiver = Some(addr),
+            Err(err) => eprintln!("ignoring invalid receiver address argument: {err}"),
+        }
+    }
+    settings.save(&support_dir);
 
     if is_login_item() {
         let _ = set_login_item(true);
     }
 
-    eprintln!("hotswitch sender starting, target: {target_addr}");
+    eprintln!(
+        "hotswitch sender starting, target: {}",
+        settings.receiver.as_deref().unwrap_or("none")
+    );
 
     let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind UDP socket");
-    socket
-        .connect(&target_addr)
-        .expect("Failed to connect UDP socket");
+    if let Some(addr) = &settings.receiver {
+        if let Err(err) = socket.connect(addr) {
+            eprintln!("failed to connect UDP socket to {addr}: {err}");
+        }
+    }
     socket.set_nonblocking(true).ok();
 
     start_audio_playback();
@@ -1168,243 +1482,8 @@ fn main() {
         let capturing = capturing.clone();
         let receiver_connected = receiver_connected.clone();
         let app_state = app_state.clone();
-        move || -> AppState {
-            let s = if capturing.load(Ordering::SeqCst) {
-                AppState::Capturing
-            } else if receiver_connected.load(Ordering::SeqCst) {
-                AppState::Connected
-            } else {
-                AppState::Waiting
-            };
-            app_state.store(s as u8, Ordering::SeqCst);
-            s
-        }
+        move || -> AppState { store_state(&capturing, &receiver_connected, &app_state) }
     };
-
-    // --- CGEventTap setup ---
-    let cap = capturing.clone();
-    let rc_tap = receiver_connected.clone();
-    let sock = socket.try_clone().expect("Failed to clone socket");
-    let keys = held_keys.clone();
-    let adx = accum_dx.clone();
-    let ady = accum_dy.clone();
-    let anchor = capture_anchor.clone();
-    let tap_port: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(ptr::null_mut()));
-    let tp = tap_port.clone();
-    let proxy_tap = proxy.clone();
-    let compute_tap = compute_state.clone();
-
-    let cg_events_of_interest: Vec<CGEventType> = vec![
-        CGEventType::LeftMouseDown,
-        CGEventType::LeftMouseUp,
-        CGEventType::RightMouseDown,
-        CGEventType::RightMouseUp,
-        CGEventType::OtherMouseDown,
-        CGEventType::OtherMouseUp,
-        CGEventType::MouseMoved,
-        CGEventType::LeftMouseDragged,
-        CGEventType::RightMouseDragged,
-        CGEventType::OtherMouseDragged,
-        CGEventType::ScrollWheel,
-        CGEventType::KeyDown,
-        CGEventType::KeyUp,
-        CGEventType::FlagsChanged,
-    ];
-
-    let event_tap_callback = move |_proxy: CGEventTapProxy,
-                                   event_type: CGEventType,
-                                   cg_ev: &CGEvent|
-          -> CallbackResult {
-        if matches!(
-            event_type,
-            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-        ) {
-            eprintln!("WARNING: CGEventTap was disabled, re-enabling");
-            let port = tp.load(Ordering::SeqCst);
-            if !port.is_null() {
-                unsafe {
-                    CGEventTapEnable(port, true);
-                }
-            }
-            return CallbackResult::Keep;
-        }
-
-        if matches!(event_type, CGEventType::KeyDown) {
-            let keycode = cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-            if keycode == HOTKEY_KEYCODE {
-                let flags = cg_ev.get_flags();
-                let ctrl_held = flags.contains(CGEventFlags::CGEventFlagControl);
-                if ctrl_held || !HOTKEY_REQUIRES_CTRL {
-                    let was_capturing = cap.load(Ordering::SeqCst);
-                    if !was_capturing && !rc_tap.load(Ordering::SeqCst) {
-                        let _ = proxy_tap.send_event(UserEvent::CaptureBlocked);
-                        return CallbackResult::Drop;
-                    }
-                    let now_capturing = !was_capturing;
-
-                    if now_capturing {
-                        cap.store(true, Ordering::SeqCst);
-                        let cursor_pos = cg_ev.location();
-                        eprintln!("capture started: anchor={cursor_pos:?}");
-                        *anchor.lock().unwrap() = Some(cursor_pos);
-                        let associate_result =
-                            unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
-                        eprintln!("cursor capture: associate result={associate_result}");
-                        let hide_result = CGDisplay::hide_cursor(&CGDisplay::main());
-                        eprintln!("cursor capture: hide result={hide_result:?}");
-                        let warp_result = CGDisplay::warp_mouse_cursor_position(cursor_pos);
-                        eprintln!("cursor capture: warp result={warp_result:?}");
-                        *adx.lock().unwrap() = 0.0;
-                        *ady.lock().unwrap() = 0.0;
-                    } else {
-                        let _ = disengage_capture(
-                            "hotkey",
-                            cap.as_ref(),
-                            anchor.as_ref(),
-                            keys.as_ref(),
-                            adx.as_ref(),
-                            ady.as_ref(),
-                            &sock,
-                        );
-                    }
-                    compute_tap();
-                    let _ = proxy_tap.send_event(UserEvent::StateChanged);
-                    return CallbackResult::Drop;
-                }
-            }
-        }
-
-        if !cap.load(Ordering::SeqCst) {
-            return CallbackResult::Keep;
-        }
-
-        let mut buf = [0u8; 64];
-
-        match event_type {
-            CGEventType::MouseMoved
-            | CGEventType::LeftMouseDragged
-            | CGEventType::RightMouseDragged
-            | CGEventType::OtherMouseDragged => {
-                let raw_dx = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
-                let raw_dy = cg_ev.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-                let mut ax = adx.lock().unwrap();
-                let mut ay = ady.lock().unwrap();
-                *ax += raw_dx;
-                *ay += raw_dy;
-                let dx = (*ax).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                let dy = (*ay).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                *ax -= dx as f64;
-                *ay -= dy as f64;
-                if dx != 0 || dy != 0 {
-                    let evt = Event::MouseMove { dx, dy };
-                    let len = evt.to_bytes(&mut buf);
-                    let _ = sock.send(&buf[..len]);
-                    if let Some(anchor_pos) = *anchor.lock().unwrap() {
-                        let _ = CGDisplay::warp_mouse_cursor_position(anchor_pos);
-                    }
-                }
-            }
-
-            CGEventType::LeftMouseDown
-            | CGEventType::LeftMouseUp
-            | CGEventType::RightMouseDown
-            | CGEventType::RightMouseUp
-            | CGEventType::OtherMouseDown
-            | CGEventType::OtherMouseUp => {
-                if let Some((button, pressed)) = map_mouse_button(&event_type, cg_ev) {
-                    let evt = Event::MouseButton { button, pressed };
-                    let len = evt.to_bytes(&mut buf);
-                    let _ = sock.send(&buf[..len]);
-                }
-            }
-
-            CGEventType::ScrollWheel => {
-                let v = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
-                    as i16;
-                let h = cg_ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
-                    as i16;
-                if v != 0 || h != 0 {
-                    let evt = Event::Scroll { dx: h, dy: v };
-                    let len = evt.to_bytes(&mut buf);
-                    let _ = sock.send(&buf[..len]);
-                }
-            }
-
-            CGEventType::KeyDown => {
-                let keycode =
-                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                keys.lock().unwrap().insert(keycode);
-                let evt = Event::Key {
-                    keycode,
-                    pressed: true,
-                };
-                let len = evt.to_bytes(&mut buf);
-                let _ = sock.send(&buf[..len]);
-            }
-            CGEventType::KeyUp => {
-                let keycode =
-                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                keys.lock().unwrap().remove(&keycode);
-                let evt = Event::Key {
-                    keycode,
-                    pressed: false,
-                };
-                let len = evt.to_bytes(&mut buf);
-                let _ = sock.send(&buf[..len]);
-            }
-            CGEventType::FlagsChanged => {
-                let keycode =
-                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                let flags = cg_ev.get_flags();
-                let mut k = keys.lock().unwrap();
-                let pressed = match keycode {
-                    0x38 | 0x3C => flags.contains(CGEventFlags::CGEventFlagShift),
-                    0x3B | 0x3E => flags.contains(CGEventFlags::CGEventFlagControl),
-                    0x3A | 0x3D => flags.contains(CGEventFlags::CGEventFlagAlternate),
-                    0x37 | 0x36 => flags.contains(CGEventFlags::CGEventFlagCommand),
-                    0x39 => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
-                    _ => !k.contains(&keycode),
-                };
-                if pressed {
-                    k.insert(keycode);
-                } else {
-                    k.remove(&keycode);
-                }
-                drop(k);
-                let evt = Event::Key { keycode, pressed };
-                let len = evt.to_bytes(&mut buf);
-                let _ = sock.send(&buf[..len]);
-            }
-
-            _ => {}
-        }
-
-        CallbackResult::Drop
-    };
-
-    let tap = CGEventTap::new(
-        CGEventTapLocation::Session,
-        CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::Default,
-        cg_events_of_interest,
-        event_tap_callback,
-    )
-    .expect("Failed to create CGEventTap — is Accessibility permission granted?");
-
-    tap_port.store(
-        tap.mach_port().as_CFTypeRef() as *mut c_void,
-        Ordering::SeqCst,
-    );
-
-    let source = tap
-        .mach_port()
-        .create_runloop_source(0)
-        .expect("Failed to create runloop source");
-
-    unsafe {
-        CFRunLoop::get_current()
-            .add_source(&source, core_foundation::runloop::kCFRunLoopCommonModes);
-    }
 
     // --- Heartbeat listener thread ---
     let sock_rx = socket.try_clone().expect("Failed to clone socket");
@@ -1465,7 +1544,35 @@ fn main() {
         }
     });
 
-    // --- Tray icon setup + event loop ---
+    {
+        let proxy = Mutex::new(proxy.clone());
+        passthrough::watch_devices(move || {
+            let _ = proxy
+                .lock()
+                .unwrap()
+                .send_event(UserEvent::AudioDevicesChanged);
+        });
+    }
+
+    // --- Event tap ---
+    let tap_ctx = TapContext {
+        capturing: capturing.clone(),
+        held_keys: held_keys.clone(),
+        accum_dx: accum_dx.clone(),
+        accum_dy: accum_dy.clone(),
+        capture_anchor: capture_anchor.clone(),
+        socket: Arc::new(socket.try_clone().expect("Failed to clone socket")),
+        hotkeys: Arc::new(Mutex::new(settings.hotkeys)),
+        recording: Arc::new(AtomicU8::new(0)),
+        proxy: proxy.clone(),
+    };
+    let tap = create_event_tap(&tap_ctx);
+    if tap.is_none() {
+        eprintln!("event tap unavailable: Hotswitch needs Accessibility access");
+        request_accessibility();
+    }
+
+    // --- Tray icon ---
     let update_item = MenuItem::new("Check for Updates", true, None);
     {
         let proxy = proxy.clone();
@@ -1477,21 +1584,41 @@ fn main() {
         });
     }
 
-    let menu = Menu::new();
-    let status_item = MenuItem::new(AppState::Waiting.status_text(), false, None);
-    let address_item = MenuItem::new("Receiver Address...", true, None);
-    let log_item = MenuItem::new("Show Log", true, None);
-    let login_item = CheckMenuItem::new("Start on Login", true, is_login_item(), None);
-    let quit_item = MenuItem::new("Quit", true, None);
-    let _ = menu.append_items(&[
-        &status_item,
+    let ui = MenuUi {
+        menu: Menu::new(),
+        modes: Mode::ALL.map(|mode| CheckMenuItem::new(mode.label(), true, false, None)),
+        monitor_line: MenuItem::new("", false, None),
+        level_line: MenuItem::new("", false, None),
+        route_line: MenuItem::new("", false, None),
+        pc_line: MenuItem::new("", false, None),
+        access_item: MenuItem::new("Allow Accessibility Access…", true, None),
+        settings_item: MenuItem::new(
+            "Settings…",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Comma)),
+        ),
+        log_item: MenuItem::new("Show Log", true, None),
+        update_item,
+        quit_item: MenuItem::new(
+            "Quit Hotswitch",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyQ)),
+        ),
+        ps5_shown: false,
+        access_shown: false,
+    };
+    let _ = ui.menu.append_items(&[
+        &ui.modes[0],
+        &ui.modes[1],
+        &ui.modes[2],
         &PredefinedMenuItem::separator(),
-        &update_item,
-        &address_item,
-        &log_item,
-        &login_item,
+        &ui.pc_line,
         &PredefinedMenuItem::separator(),
-        &quit_item,
+        &ui.settings_item,
+        &ui.log_item,
+        &ui.update_item,
+        &PredefinedMenuItem::separator(),
+        &ui.quit_item,
     ]);
 
     let menu_proxy = proxy.clone();
@@ -1499,230 +1626,740 @@ fn main() {
         let _ = menu_proxy.send_event(UserEvent::Menu(evt));
     }));
 
-    let initial_state = AppState::Waiting;
-    let (init_icon, init_template) = initial_state.icon();
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip(initial_state.tooltip())
-        .with_icon(init_icon)
-        .with_icon_as_template(init_template)
+        .with_menu(Box::new(ui.menu.clone()))
+        .with_tooltip("Hotswitch")
+        .with_icon(make_icon(0, 0, 0, false))
+        .with_icon_as_template(true)
         .build()
         .expect("Failed to create tray icon");
 
-    let update_id = update_item.id().clone();
-    let address_id = address_item.id().clone();
-    let log_id = log_item.id().clone();
-    let login_id = login_item.id().clone();
-    let quit_id = quit_item.id().clone();
-    let mut login_checked = is_login_item();
-    let mut configured_target_addr = target_addr.clone();
-    let _lifecycle_guard = (workspace_center, distributed_center, lifecycle_observer);
-    let mut power_activity = Some(power_activity);
+    let mut app = App {
+        mtm,
+        support_dir,
+        mode: Mode::Mac,
+        monitor_jobs: spawn_monitor_worker(proxy.clone()),
+        settings,
+        socket,
+        tap_ctx,
+        tap,
+        receiver_connected,
+        app_state,
+        passthrough: None,
+        passthrough_error: None,
+        monitor_line: String::new(),
+        awaiting_mic: None,
+        ui,
+        tray,
+        icon_look: None,
+        settings_window: None,
+        proxy,
+        login_checked: is_login_item(),
+        receiver_hook_active: false,
+        flash_until: None,
+        reset_update_at: None,
+        next_tick: None,
+        audio_check_at: None,
+        quitting: false,
+        power_activity: Some(power_activity),
+        log_file_path,
+        _lifecycle_guard: (workspace_center, distributed_center, lifecycle_observer),
+    };
 
-    let mut last_state = initial_state;
-    let mut receiver_hook_active = false;
-    let mut flash_until: Option<Instant> = None;
-    let mut reset_update_at: Option<Instant> = None;
+    // A previous run quit or crashed in PS5 mode: hand the monitor back.
+    if let Some(restore) = app.settings.restore_input {
+        let _ = app.monitor_jobs.send(MonitorJob::Return {
+            monitor: app.settings.monitor.clone(),
+            from: app.settings.ps5_input,
+            fallback: Some(restore),
+            done: None,
+        });
+    }
+    app.refresh_menu();
+    app.schedule_tick();
 
-    event_loop.run(move |event, _, control_flow| {
-        let next_wake = [flash_until, reset_update_at]
-            .iter()
-            .filter_map(|t| *t)
-            .min();
-        *control_flow = match next_wake {
-            Some(d) if d > Instant::now() => ControlFlow::WaitUntil(d),
-            _ => ControlFlow::Wait,
+    event_loop.run(move |event, _, control_flow| app.handle(event, control_flow));
+}
+
+struct MenuUi {
+    menu: Menu,
+    modes: [CheckMenuItem; 3],
+    monitor_line: MenuItem,
+    level_line: MenuItem,
+    route_line: MenuItem,
+    pc_line: MenuItem,
+    access_item: MenuItem,
+    settings_item: MenuItem,
+    log_item: MenuItem,
+    update_item: MenuItem,
+    quit_item: MenuItem,
+    ps5_shown: bool,
+    access_shown: bool,
+}
+
+struct App {
+    mtm: MainThreadMarker,
+    support_dir: PathBuf,
+    settings: Settings,
+    mode: Mode,
+    socket: UdpSocket,
+    tap_ctx: TapContext,
+    tap: Option<CGEventTap<'static>>,
+    receiver_connected: Arc<AtomicBool>,
+    app_state: Arc<AtomicU8>,
+    passthrough: Option<Passthrough>,
+    passthrough_error: Option<String>,
+    monitor_jobs: mpsc::Sender<MonitorJob>,
+    monitor_line: String,
+    /// PS5 mode is waiting for the microphone prompt before switching the monitor away.
+    awaiting_mic: Option<Instant>,
+    ui: MenuUi,
+    tray: TrayIcon,
+    icon_look: Option<(Mode, bool)>,
+    settings_window: Option<SettingsWindow>,
+    proxy: EventLoopProxy<UserEvent>,
+    login_checked: bool,
+    receiver_hook_active: bool,
+    flash_until: Option<Instant>,
+    reset_update_at: Option<Instant>,
+    next_tick: Option<Instant>,
+    /// Debounced check of the passthrough's devices after a device change.
+    audio_check_at: Option<Instant>,
+    quitting: bool,
+    power_activity: Option<PowerActivity>,
+    log_file_path: PathBuf,
+    _lifecycle_guard: (
+        Retained<NSNotificationCenter>,
+        Retained<NSDistributedNotificationCenter>,
+        Retained<LifecycleObserver>,
+    ),
+}
+
+impl App {
+    fn handle(&mut self, event: tao::event::Event<UserEvent>, control_flow: &mut ControlFlow) {
+        match event {
+            tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) => {
+                self.on_timers()
+            }
+            tao::event::Event::LoopDestroyed => {
+                if self.receiver_hook_active {
+                    self.receiver_hook_active = false;
+                    run_hook(HookKind::ReceiverDisconnected, true, &[]);
+                }
+            }
+            tao::event::Event::UserEvent(ue) => self.on_user_event(ue),
+            _ => {}
+        }
+
+        let next_wake = [
+            self.flash_until,
+            self.reset_update_at,
+            self.next_tick,
+            self.audio_check_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        *control_flow = if self.quitting {
+            ControlFlow::Exit
+        } else {
+            match next_wake {
+                Some(t) if t > Instant::now() => ControlFlow::WaitUntil(t),
+                Some(_) => ControlFlow::Poll,
+                None => ControlFlow::Wait,
+            }
         };
+    }
 
-        if let tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) =
-            &event
+    fn on_timers(&mut self) {
+        let now = Instant::now();
+        if self.flash_until.is_some_and(|t| now >= t) {
+            self.flash_until = None;
+            self.icon_look = None;
+            self.refresh_icon();
+        }
+        if self.reset_update_at.is_some_and(|t| now >= t) {
+            self.reset_update_at = None;
+            self.ui.update_item.set_text("Check for Updates");
+        }
+        if self.audio_check_at.is_some_and(|t| now >= t) {
+            self.audio_check_at = None;
+            self.check_audio();
+        }
+        if self.next_tick.is_some_and(|t| now >= t) {
+            self.tick();
+        }
+    }
+
+    /// After audio devices settle: rebind input and output if theirs went away and came back,
+    /// otherwise follow the default output, or start if the input has just appeared.
+    fn check_audio(&mut self) {
+        if !self.wants_passthrough() {
+            return;
+        }
+        match self.passthrough.as_ref().map(|p| p.needs_rebind()) {
+            Some(true) => {
+                eprintln!("passthrough: audio devices changed, rebinding input and output");
+                self.passthrough = None;
+                self.start_passthrough();
+            }
+            Some(false) => {
+                if let Some(p) = &mut self.passthrough {
+                    p.follow_default_output();
+                }
+            }
+            None => self.start_passthrough(),
+        }
+        self.refresh_status_lines();
+    }
+
+    fn on_user_event(&mut self, event: UserEvent) {
+        match event {
+            UserEvent::StateChanged => {
+                let receiver_is_connected = self.receiver_connected.load(Ordering::SeqCst);
+                if receiver_is_connected && !self.receiver_hook_active {
+                    self.receiver_hook_active = true;
+                    run_hook(HookKind::ReceiverConnected, false, &[]);
+                } else if !receiver_is_connected && self.receiver_hook_active {
+                    self.receiver_hook_active = false;
+                    run_hook(HookKind::ReceiverDisconnected, false, &[]);
+                }
+                self.refresh_menu();
+                self.refresh_settings_note();
+            }
+            UserEvent::UpdateAvailable(ver) => {
+                self.ui.update_item.set_text(format!("Update to v{ver}"));
+            }
+            UserEvent::ReleaseCapture(reason) => {
+                if self.release_capture(reason) && self.mode == Mode::Windows {
+                    self.mode = Mode::Mac;
+                    run_hook(HookKind::ModeChanged, false, &["windows", "mac"]);
+                    self.refresh_menu();
+                }
+            }
+            UserEvent::Hotkey(mode) => self.switch_to(mode, true),
+            UserEvent::HotkeyRecorded(mode, result) => self.hotkey_recorded(mode, result),
+            UserEvent::Monitor(result) => self.monitor_result(result),
+            UserEvent::Settings(action) => self.settings_action(action),
+            UserEvent::AudioDevicesChanged => {
+                self.audio_check_at = Some(Instant::now() + AUDIO_SETTLE);
+            }
+            UserEvent::Menu(me) => self.menu_event(me),
+        }
+    }
+
+    fn menu_event(&mut self, me: MenuEvent) {
+        if let Some(i) = self.ui.modes.iter().position(|m| m.id() == &me.id) {
+            self.switch_to(Mode::ALL[i], false);
+            self.refresh_menu();
+        } else if me.id == *self.ui.quit_item.id() {
+            self.teardown("quit");
+            self.quitting = true;
+        } else if me.id == *self.ui.settings_item.id() {
+            self.open_settings();
+        } else if me.id == *self.ui.access_item.id() {
+            request_accessibility();
+            let _ = std::process::Command::new("open")
+                .arg(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                )
+                .spawn();
+        } else if me.id == *self.ui.log_item.id() {
+            let _ = std::process::Command::new("open")
+                .arg("-t")
+                .arg(&self.log_file_path)
+                .spawn();
+        } else if me.id == *self.ui.update_item.id() {
+            self.check_for_updates();
+        }
+    }
+
+    /// `toggle`: a shortcut for the current mode goes back to Mac.
+    fn switch_to(&mut self, requested: Mode, toggle: bool) {
+        let target = if toggle && requested == self.mode {
+            Mode::Mac
+        } else {
+            requested
+        };
+        if target == self.mode {
+            return;
+        }
+        if target == Mode::Windows
+            && !(self.receiver_connected.load(Ordering::SeqCst) && self.tap.is_some())
         {
-            let now = Instant::now();
-            if flash_until.map_or(false, |d| now >= d) {
-                flash_until = None;
-                let (icon, tmpl) = last_state.icon();
-                let _ = tray.set_icon_with_as_template(Some(icon), tmpl);
-                let _ = tray.set_tooltip(Some(last_state.tooltip()));
-            }
-            if reset_update_at.map_or(false, |d| now >= d) {
-                reset_update_at = None;
-                update_item.set_text("Check for Updates");
-            }
+            self.flash_blocked();
+            return;
         }
 
-        if let tao::event::Event::LoopDestroyed = &event {
-            if receiver_hook_active {
-                receiver_hook_active = false;
-                run_hook(HookKind::ReceiverDisconnected, true);
-            }
+        let from = self.mode;
+        eprintln!("mode: {} -> {}", from.key(), target.key());
+        if from == Mode::Windows {
+            self.release_capture("mode switch");
+        }
+        self.mode = target;
+
+        // Audio follows the mode's route; the UDP listener runs regardless.
+        self.passthrough = None;
+        self.passthrough_error = None;
+        self.awaiting_mic = None;
+        let wants_passthrough = self.wants_passthrough();
+        if wants_passthrough {
+            self.start_passthrough();
         }
 
-        if let tao::event::Event::UserEvent(ue) = &event {
-            match ue {
-                UserEvent::StateChanged => {
-                    let new_state = AppState::from_u8(app_state.load(Ordering::SeqCst));
-                    let receiver_is_connected = receiver_connected.load(Ordering::SeqCst);
-                    if receiver_is_connected && !receiver_hook_active {
-                        receiver_hook_active = true;
-                        run_hook(HookKind::ReceiverConnected, false);
-                    } else if !receiver_is_connected && receiver_hook_active {
-                        receiver_hook_active = false;
-                        run_hook(HookKind::ReceiverDisconnected, false);
-                    }
+        // Monitor input.
+        match (
+            self.settings.monitor_input(from),
+            self.settings.monitor_input(target),
+        ) {
+            (_, Some(input)) => {
+                if wants_passthrough && matches!(passthrough::mic_access(), MicAccess::Undetermined)
+                {
+                    passthrough::request_mic_access();
+                    self.awaiting_mic = Some(Instant::now());
+                    self.monitor_line = "Allow the microphone to continue".into();
+                } else {
+                    self.take_monitor(input);
+                }
+            }
+            (Some(from_input), None) => {
+                let _ = self.monitor_jobs.send(MonitorJob::Return {
+                    monitor: self.settings.monitor.clone(),
+                    from: from_input,
+                    fallback: self.settings.restore_input,
+                    done: None,
+                });
+            }
+            (None, None) => {}
+        }
 
-                    if new_state != last_state {
-                        if flash_until.is_none() {
-                            let (icon, tmpl) = new_state.icon();
-                            let _ = tray.set_icon_with_as_template(Some(icon), tmpl);
-                            let _ = tray.set_tooltip(Some(new_state.tooltip()));
-                        }
-                        status_item.set_text(new_state.status_text());
-                        last_state = new_state;
-                    }
+        if target == Mode::Windows {
+            let (anchor, dx, dy) = (
+                &self.tap_ctx.capture_anchor,
+                &self.tap_ctx.accum_dx,
+                &self.tap_ctx.accum_dy,
+            );
+            engage_capture(cursor_position(), &self.tap_ctx.capturing, anchor, dx, dy);
+        }
+        store_state(
+            &self.tap_ctx.capturing,
+            &self.receiver_connected,
+            &self.app_state,
+        );
+        run_hook(HookKind::ModeChanged, false, &[from.key(), target.key()]);
+        self.refresh_menu();
+        self.schedule_tick();
+    }
+
+    fn take_monitor(&mut self, input: u16) {
+        self.monitor_line = format!("Switching to {}…", ddc::input_name(input));
+        let _ = self.monitor_jobs.send(MonitorJob::Take {
+            monitor: self.settings.monitor.clone(),
+            input,
+        });
+    }
+
+    fn wants_passthrough(&self) -> bool {
+        matches!(
+            self.settings.audio_route(self.mode),
+            Some(AudioRoute::Passthrough { .. })
+        )
+    }
+
+    fn start_passthrough(&mut self) {
+        let Some(AudioRoute::Passthrough { input }) = self.settings.audio_route(self.mode) else {
+            return;
+        };
+        match Passthrough::start(&input) {
+            Ok(p) => {
+                eprintln!("passthrough: started from {input}");
+                self.passthrough = Some(p);
+                self.passthrough_error = None;
+            }
+            Err(e) => {
+                if self.passthrough_error.as_deref() != Some(e.as_str()) {
+                    eprintln!("passthrough: {e}");
                 }
-                UserEvent::UpdateAvailable(ver) => {
-                    update_item.set_text(format!("Update to v{ver}"));
-                }
-                UserEvent::CaptureBlocked => {
-                    let _ =
-                        tray.set_icon_with_as_template(Some(make_icon(220, 38, 38, true)), false);
-                    let _ = tray.set_tooltip(Some("Hotswitch — No receiver"));
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    flash_until = Some(deadline);
-                    *control_flow = ControlFlow::WaitUntil(deadline);
-                }
-                UserEvent::ReleaseCapture(reason) => {
-                    if disengage_capture(
-                        reason,
-                        capturing.as_ref(),
-                        capture_anchor.as_ref(),
-                        held_keys.as_ref(),
-                        accum_dx.as_ref(),
-                        accum_dy.as_ref(),
-                        &socket,
-                    ) {
-                        let new_state = compute_state();
-                        if new_state != last_state {
-                            let (icon, tmpl) = new_state.icon();
-                            let _ = tray.set_icon_with_as_template(Some(icon), tmpl);
-                            let _ = tray.set_tooltip(Some(new_state.tooltip()));
-                            status_item.set_text(new_state.status_text());
-                            last_state = new_state;
-                        }
-                    }
-                }
-                UserEvent::Menu(me) => {
-                    if me.id == quit_id {
-                        let _ = disengage_capture(
-                            "quit",
-                            capturing.as_ref(),
-                            capture_anchor.as_ref(),
-                            held_keys.as_ref(),
-                            accum_dx.as_ref(),
-                            accum_dy.as_ref(),
-                            &socket,
-                        );
-                        if let Some(activity) = power_activity.take() {
-                            activity.stop();
-                        }
-                        if receiver_hook_active {
-                            receiver_hook_active = false;
-                            run_hook(HookKind::ReceiverDisconnected, true);
-                        }
-                        *control_flow = ControlFlow::Exit;
-                    } else if me.id == update_id {
-                        let exe = std::env::current_exe().expect("Failed to get current exe path");
-                        update_item.set_text("Updating...");
-                        update_item.set_enabled(false);
-                        match apply_update() {
-                            Ok(outcome) => match outcome {
-                                UpdateOutcome::UpdatedAndRelaunching => {
-                                    eprintln!("relaunching: {exe:?}");
-                                    if current_app_bundle_path().is_none() {
-                                        match std::process::Command::new(&exe).spawn() {
-                                            Ok(_) => {}
-                                            Err(e) => eprintln!("relaunch failed: {e}"),
-                                        }
-                                    }
-                                    if let Some(activity) = power_activity.take() {
-                                        activity.stop();
-                                    }
-                                    if receiver_hook_active {
-                                        receiver_hook_active = false;
-                                        run_hook(HookKind::ReceiverDisconnected, true);
-                                    }
-                                    *control_flow = ControlFlow::Exit;
-                                    return;
-                                }
-                                UpdateOutcome::AlreadyUpToDate => {
-                                    update_item.set_text("Already up to date");
-                                    let deadline = Instant::now() + Duration::from_secs(5);
-                                    reset_update_at = Some(deadline);
-                                    *control_flow = ControlFlow::WaitUntil(deadline);
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("update failed: {e}");
-                                update_item.set_text("Update failed");
-                                let deadline = Instant::now() + Duration::from_secs(5);
-                                reset_update_at = Some(deadline);
-                                *control_flow = ControlFlow::WaitUntil(deadline);
-                            }
-                        }
-                        update_item.set_enabled(true);
-                    } else if me.id == log_id {
-                        let _ = std::process::Command::new("open")
-                            .arg("-t")
-                            .arg(&log_file_path)
-                            .spawn();
-                    } else if me.id == address_id {
-                        if let Some(new_addr) =
-                            prompt_for_receiver_address(Some(&configured_target_addr))
-                        {
-                            if new_addr != configured_target_addr
-                                && save_receiver_address(&new_addr)
-                            {
-                                configured_target_addr = new_addr;
-                                if login_checked {
-                                    let _ = set_login_item(true);
-                                }
-                                let _ = disengage_capture(
-                                    "receiver address changed",
-                                    capturing.as_ref(),
-                                    capture_anchor.as_ref(),
-                                    held_keys.as_ref(),
-                                    accum_dx.as_ref(),
-                                    accum_dy.as_ref(),
-                                    &socket,
-                                );
-                                if let Some(activity) = power_activity.take() {
-                                    activity.stop();
-                                }
-                                if receiver_hook_active {
-                                    receiver_hook_active = false;
-                                    run_hook(HookKind::ReceiverDisconnected, true);
-                                }
-                                match std::process::Command::new(
-                                    std::env::current_exe()
-                                        .expect("Failed to get current exe path"),
-                                )
-                                .spawn()
-                                {
-                                    Ok(_) => *control_flow = ControlFlow::Exit,
-                                    Err(err) => {
-                                        eprintln!("relaunch after address change failed: {err}")
-                                    }
-                                }
-                            }
-                        }
-                    } else if me.id == login_id {
-                        if set_login_item(!login_checked) {
-                            login_checked = !login_checked;
-                            login_item.set_checked(login_checked);
-                        }
-                    }
+                self.passthrough_error = Some(e);
+            }
+        }
+    }
+
+    fn release_capture(&self, reason: &str) -> bool {
+        let ctx = &self.tap_ctx;
+        disengage_capture(
+            reason,
+            ctx.capturing.as_ref(),
+            ctx.capture_anchor.as_ref(),
+            ctx.held_keys.as_ref(),
+            ctx.accum_dx.as_ref(),
+            ctx.accum_dy.as_ref(),
+            &self.socket,
+        )
+    }
+
+    fn flash_blocked(&mut self) {
+        let _ = self
+            .tray
+            .set_icon_with_as_template(Some(make_icon(220, 38, 38, true)), false);
+        let reason = if self.tap.is_none() {
+            "Hotswitch: allow Accessibility first"
+        } else {
+            "Hotswitch: PC not reachable"
+        };
+        let _ = self.tray.set_tooltip(Some(reason));
+        self.flash_until = Some(Instant::now() + Duration::from_secs(2));
+    }
+
+    /// Housekeeping while something needs watching: the tap, PS5 audio, the mic prompt.
+    fn tick(&mut self) {
+        self.next_tick = None;
+        if self.tap.is_none() {
+            self.tap = create_event_tap(&self.tap_ctx);
+            if self.tap.is_some() {
+                eprintln!("event tap ready");
+                self.refresh_menu();
+            }
+        }
+        if let Some(since) = self.awaiting_mic {
+            let decided = !matches!(passthrough::mic_access(), MicAccess::Undetermined);
+            if decided || since.elapsed() > Duration::from_secs(60) {
+                self.awaiting_mic = None;
+                if let Some(input) = self.settings.monitor_input(self.mode) {
+                    self.take_monitor(input);
                 }
             }
         }
-    });
+        // Safety net for a device that dies without a device-list change.
+        let dead = self.passthrough.as_ref().is_some_and(|p| !p.is_alive());
+        if dead && self.audio_check_at.is_none() {
+            self.audio_check_at = Some(Instant::now() + AUDIO_SETTLE);
+        }
+        self.refresh_status_lines();
+        self.schedule_tick();
+    }
+
+    fn schedule_tick(&mut self) {
+        let every = if self.mode == Mode::Ps5 || self.awaiting_mic.is_some() {
+            Some(Duration::from_millis(500))
+        } else if self.tap.is_none() {
+            Some(Duration::from_secs(2))
+        } else {
+            None
+        };
+        self.next_tick = every.map(|d| Instant::now() + d);
+    }
+
+    fn monitor_result(&mut self, result: MonitorResult) {
+        match result {
+            MonitorResult::Took {
+                name,
+                input,
+                previous,
+            } => {
+                self.monitor_line = format!("{name} on {}", ddc::input_name(input));
+                if previous.is_some() {
+                    self.settings.restore_input = previous;
+                    self.save();
+                }
+            }
+            MonitorResult::Returned { name, input } => {
+                self.monitor_line = format!("{name} back on {}", ddc::input_name(input));
+                if self.settings.restore_input.take().is_some() {
+                    self.save();
+                }
+            }
+            MonitorResult::Failed(e) => self.monitor_line = e,
+        }
+        self.refresh_status_lines();
+    }
+
+    fn hotkey_recorded(&mut self, mode: Mode, result: Recorded) {
+        match result {
+            Recorded::Set(hotkey) => {
+                for h in self.settings.hotkeys.iter_mut() {
+                    if *h == Some(hotkey) {
+                        *h = None;
+                    }
+                }
+                self.settings.hotkeys[mode.index()] = Some(hotkey);
+            }
+            Recorded::Clear => self.settings.hotkeys[mode.index()] = None,
+            Recorded::Cancel => {}
+        }
+        *self.tap_ctx.hotkeys.lock().unwrap() = self.settings.hotkeys;
+        self.save();
+        if let Some(window) = &self.settings_window {
+            for m in Mode::ALL {
+                window.set_hotkey_title(m, &self.settings, false);
+            }
+        }
+        self.refresh_menu();
+    }
+
+    fn open_settings(&mut self) {
+        let (mtm, proxy) = (self.mtm, self.proxy.clone());
+        let window = self.settings_window.get_or_insert_with(|| {
+            SettingsWindow::new(mtm, move |action| {
+                let _ = proxy.send_event(UserEvent::Settings(action));
+            })
+        });
+        window.show(&self.settings, self.login_checked, "");
+        self.refresh_settings_note();
+    }
+
+    fn refresh_settings_note(&self) {
+        if let Some(window) = self.settings_window.as_ref().filter(|w| w.is_visible()) {
+            window.set_receiver_note(&self.pc_status(), false);
+        }
+    }
+
+    fn settings_action(&mut self, action: Action) {
+        match action {
+            Action::Receiver(text) => self.set_receiver(&text),
+            Action::Monitor(id) => {
+                self.settings.monitor = id;
+                self.save();
+            }
+            Action::Ps5Input(input) => {
+                self.settings.ps5_input = input;
+                self.save();
+            }
+            Action::AudioInput(name) => {
+                self.settings.audio_input = name;
+                self.save();
+                if self.wants_passthrough() {
+                    self.passthrough = None;
+                    self.start_passthrough();
+                }
+            }
+            Action::RecordHotkey(mode) => {
+                let previous = self
+                    .tap_ctx
+                    .recording
+                    .swap(mode.index() as u8 + 1, Ordering::SeqCst);
+                if let Some(window) = &self.settings_window {
+                    if let Some(&prev) = (previous as usize)
+                        .checked_sub(1)
+                        .and_then(|i| Mode::ALL.get(i))
+                    {
+                        window.set_hotkey_title(prev, &self.settings, false);
+                    }
+                    window.set_hotkey_title(mode, &self.settings, true);
+                }
+            }
+            Action::StartOnLogin(on) => {
+                if set_login_item(on) {
+                    self.login_checked = on;
+                }
+            }
+            Action::Closed => {
+                self.tap_ctx.recording.store(0, Ordering::SeqCst);
+                if let Some(text) = self.settings_window.as_ref().map(|w| w.receiver_text()) {
+                    if !text.trim().is_empty()
+                        && Some(text.trim()) != self.settings.receiver.as_deref()
+                    {
+                        self.set_receiver(&text);
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_receiver(&mut self, text: &str) {
+        let note = |app: &Self, text: &str, error: bool| {
+            if let Some(window) = &app.settings_window {
+                window.set_receiver_note(text, error);
+            }
+        };
+        match parse_receiver_address(text) {
+            Ok(addr) if Some(&addr) == self.settings.receiver.as_ref() => {
+                note(self, &self.pc_status(), false)
+            }
+            Ok(addr) => {
+                if self.mode == Mode::Windows {
+                    self.switch_to(Mode::Mac, false);
+                }
+                // All clones share this socket, so heartbeats and input follow the new address.
+                if let Err(e) = self.socket.connect(&addr) {
+                    note(self, &format!("Couldn't use {addr}: {e}"), true);
+                    return;
+                }
+                eprintln!("receiver address changed to {addr}");
+                self.settings.receiver = Some(addr);
+                self.save();
+                note(self, "Saved. Looking for the PC…", false);
+                self.refresh_menu();
+            }
+            Err(message) => note(self, message, true),
+        }
+    }
+
+    fn check_for_updates(&mut self) {
+        let exe = std::env::current_exe().expect("Failed to get current exe path");
+        self.ui.update_item.set_text("Updating...");
+        self.ui.update_item.set_enabled(false);
+        match apply_update() {
+            Ok(UpdateOutcome::UpdatedAndRelaunching) => {
+                eprintln!("relaunching: {exe:?}");
+                if current_app_bundle_path().is_none() {
+                    if let Err(e) = std::process::Command::new(&exe).spawn() {
+                        eprintln!("relaunch failed: {e}");
+                    }
+                }
+                self.teardown("update");
+                self.quitting = true;
+                return;
+            }
+            Ok(UpdateOutcome::AlreadyUpToDate) => {
+                self.ui.update_item.set_text("Already up to date");
+            }
+            Err(e) => {
+                eprintln!("update failed: {e}");
+                self.ui.update_item.set_text("Update failed");
+            }
+        }
+        self.reset_update_at = Some(Instant::now() + Duration::from_secs(5));
+        self.ui.update_item.set_enabled(true);
+    }
+
+    /// Leave the current mode cleanly before quitting or relaunching.
+    fn teardown(&mut self, reason: &str) {
+        self.release_capture(reason);
+        self.passthrough = None;
+        if let Some(from) = self.settings.monitor_input(self.mode) {
+            let (done, wait) = mpsc::channel();
+            let _ = self.monitor_jobs.send(MonitorJob::Return {
+                monitor: self.settings.monitor.clone(),
+                from,
+                fallback: self.settings.restore_input,
+                done: Some(done),
+            });
+            if wait.recv_timeout(Duration::from_secs(4)) == Ok(true) {
+                self.settings.restore_input = None;
+                self.save();
+            }
+        }
+        if self.mode != Mode::Mac {
+            run_hook(HookKind::ModeChanged, true, &[self.mode.key(), "mac"]);
+            self.mode = Mode::Mac;
+        }
+        if let Some(activity) = self.power_activity.take() {
+            activity.stop();
+        }
+        if self.receiver_hook_active {
+            self.receiver_hook_active = false;
+            run_hook(HookKind::ReceiverDisconnected, true, &[]);
+        }
+    }
+
+    fn save(&self) {
+        self.settings.save(&self.support_dir);
+    }
+
+    fn pc_status(&self) -> String {
+        match (
+            &self.settings.receiver,
+            self.receiver_connected.load(Ordering::SeqCst),
+        ) {
+            (None, _) => "No PC address set".into(),
+            (Some(_), true) => "PC connected".into(),
+            (Some(addr), false) => format!("PC not reachable at {addr}"),
+        }
+    }
+
+    fn refresh_menu(&mut self) {
+        let connected = self.receiver_connected.load(Ordering::SeqCst);
+        for (item, mode) in self.ui.modes.iter().zip(Mode::ALL) {
+            item.set_checked(mode == self.mode);
+            item.set_enabled(
+                mode != Mode::Windows
+                    || self.mode == Mode::Windows
+                    || (connected && self.tap.is_some()),
+            );
+            let _ = item
+                .set_accelerator(self.settings.hotkeys[mode.index()].and_then(|h| h.accelerator()));
+        }
+
+        // PS5 status lines sit between the modes and the PC line, only in PS5 mode.
+        let ps5 = self.mode == Mode::Ps5;
+        if ps5 != self.ui.ps5_shown {
+            let lines: [&dyn IsMenuItem; 3] = [
+                &self.ui.monitor_line,
+                &self.ui.level_line,
+                &self.ui.route_line,
+            ];
+            if ps5 {
+                let _ = self.ui.menu.insert_items(&lines, 4);
+            } else {
+                for line in lines {
+                    let _ = self.ui.menu.remove(line);
+                }
+            }
+            self.ui.ps5_shown = ps5;
+        }
+        let need_access = self.tap.is_none();
+        if need_access != self.ui.access_shown {
+            if need_access {
+                let at = if ps5 { 8 } else { 5 };
+                let _ = self.ui.menu.insert(&self.ui.access_item, at);
+            } else {
+                let _ = self.ui.menu.remove(&self.ui.access_item);
+            }
+            self.ui.access_shown = need_access;
+        }
+        self.ui.pc_line.set_text(self.pc_status());
+        self.refresh_status_lines();
+        self.refresh_icon();
+    }
+
+    fn refresh_status_lines(&self) {
+        if !self.ui.ps5_shown {
+            return;
+        }
+        self.ui.monitor_line.set_text(&self.monitor_line);
+        let (level, route) = match (&self.passthrough, &self.passthrough_error) {
+            (Some(p), _) => {
+                let status = p.status();
+                let level = match passthrough::mic_access() {
+                    MicAccess::Undetermined => "Waiting for microphone access".to_string(),
+                    MicAccess::Denied => "Microphone access is off".to_string(),
+                    MicAccess::Granted => match status.peak_db {
+                        Some(db) => format!("Signal {db:.0} dB"),
+                        None => "No signal".to_string(),
+                    },
+                };
+                let route = format!(
+                    "{} → {} · {:.0} ms",
+                    self.settings.audio_input, status.output, status.loop_ms
+                );
+                (level, route)
+            }
+            (None, Some(e)) => (e.clone(), "Waiting for it to come back".to_string()),
+            (None, None) => ("Starting audio…".to_string(), String::new()),
+        };
+        self.ui.level_line.set_text(level);
+        self.ui.route_line.set_text(route);
+    }
+
+    fn refresh_icon(&mut self) {
+        if self.flash_until.is_some() {
+            return;
+        }
+        let connected = self.receiver_connected.load(Ordering::SeqCst);
+        let look = (self.mode, connected);
+        if self.icon_look == Some(look) {
+            return;
+        }
+        self.icon_look = Some(look);
+        let (icon, template) = match self.mode {
+            Mode::Mac => (make_icon(0, 0, 0, connected), true),
+            Mode::Windows => (make_icon(234, 179, 8, true), false),
+            Mode::Ps5 => (make_icon(0, 112, 209, true), false),
+        };
+        let _ = self.tray.set_icon_with_as_template(Some(icon), template);
+        let _ = self
+            .tray
+            .set_tooltip(Some(format!("Hotswitch: {}", self.mode.label())));
+    }
 }
