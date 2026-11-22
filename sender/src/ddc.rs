@@ -8,26 +8,22 @@
 //! - a monitor is targeted only by a serial number that no other monitor shares;
 //! - before every single I2C transaction the display layout is read again, and the operation
 //!   stops if anything changed since the target was opened;
-//! - one DDC operation at a time across processes (a lock file); a read is at most two tries
-//!   with a pause, a write is sent once.
+//! - one DDC operation at a time across processes (a lock file); only writes, each sent once.
+//!   Nothing reads the monitor: one showing another input can't be trusted to answer.
 //!
 //! In a dry run (`HOTSWITCH_DRY_RUN=1`) every rule above still applies, but no DDC service
-//! is ever opened: monitors' inputs are simulated in a file in the dry run's own folder, so
-//! they survive a restart and mode and hand-back logic can be tried without hardware.
+//! is ever opened and writes are only logged.
 
-use crate::settings::{dry_run, support_dir, write_atomically};
+use crate::settings::{dry_run, support_dir};
 use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::display::CGDisplay;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::fs::File;
 use std::ptr;
-use std::thread::sleep;
-use std::time::Duration;
 
 /// VCP code for the input source (MCCS).
 pub const VCP_INPUT: u8 = 0x60;
@@ -70,13 +66,6 @@ extern "C" {
         options: u32,
     ) -> CFTypeRef;
     fn IOAVServiceCreateWithService(allocator: *const c_void, service: IoObject) -> CFTypeRef;
-    fn IOAVServiceReadI2C(
-        service: CFTypeRef,
-        chip: u32,
-        offset: u32,
-        buf: *mut u8,
-        len: u32,
-    ) -> i32;
     fn IOAVServiceWriteI2C(
         service: CFTypeRef,
         chip: u32,
@@ -92,11 +81,6 @@ const CHIP: u32 = 0x37;
 const DEST: u8 = 0x6E;
 /// The host's source address; it is sent and is part of the checksum.
 const SOURCE: u8 = 0x51;
-/// Virtual host address that seeds a reply's checksum.
-const HOST: u8 = 0x50;
-/// DDC/CI asks for 40 ms between a request and reading its reply.
-const REPLY_WAIT: Duration = Duration::from_millis(50);
-const RETRY_WAIT: Duration = Duration::from_millis(250);
 
 /// A monitor as the IORegistry describes it. Persisted in the hand-back record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,54 +294,13 @@ impl Target {
                 "ddc dry run: {} vcp {vcp:#04x} = {value}",
                 self.identity.label()
             );
-            let mut inputs = simulated_inputs();
-            inputs.insert(self.identity.serial.clone(), value);
-            let json = serde_json::to_vec_pretty(&inputs).map_err(|e| e.to_string())?;
-            return write_atomically(&support_dir().join("simulated-inputs.json"), &json)
-                .map_err(|e| format!("simulated write: {e}"));
+            return Ok(());
         }
         if unsafe { self.send(&set_request(vcp, value)) } == 0 {
             Ok(())
         } else {
             Err(format!("DDC write to {} failed", self.identity.name))
         }
-    }
-
-    /// Current value of a VCP code: at most two tries, a pause between them.
-    pub fn read(&self, vcp: u8) -> Result<u16, String> {
-        if dry_run() {
-            self.guard()?;
-            let value = simulated_inputs()
-                .get(&self.identity.serial)
-                .copied()
-                .unwrap_or(0x0F);
-            eprintln!(
-                "ddc dry run: {} vcp {vcp:#04x} is {value}",
-                self.identity.label()
-            );
-            return Ok(value);
-        }
-        for attempt in 0..2 {
-            if attempt > 0 {
-                sleep(RETRY_WAIT);
-            }
-            self.guard()?;
-            if unsafe { self.send(&get_request(vcp)) } != 0 {
-                continue;
-            }
-            sleep(REPLY_WAIT);
-            self.guard()?;
-            let mut reply = [0u8; 11];
-            let read = unsafe {
-                IOAVServiceReadI2C(self.service, CHIP, SOURCE as u32, reply.as_mut_ptr(), 11)
-            };
-            if read == 0 {
-                if let Some(value) = reply_value(&reply, vcp) {
-                    return Ok(value);
-                }
-            }
-        }
-        Err(format!("DDC read from {} failed", self.identity.name))
     }
 
     unsafe fn send(&self, packet: &[u8]) -> i32 {
@@ -378,38 +321,11 @@ fn checksum(seed: u8, bytes: &[u8]) -> u8 {
     bytes.iter().fold(seed, |c, b| c ^ b)
 }
 
-/// Get VCP Feature request. The checksum covers the destination and source addresses too.
-fn get_request(vcp: u8) -> [u8; 4] {
-    let mut p = [0x82, 0x01, vcp, 0];
-    p[3] = checksum(DEST ^ SOURCE, &p[..3]);
-    p
-}
-
 /// Set VCP Feature request.
 fn set_request(vcp: u8, value: u16) -> [u8; 6] {
     let mut p = [0x84, 0x03, vcp, (value >> 8) as u8, value as u8, 0];
     p[5] = checksum(DEST ^ SOURCE, &p[..5]);
     p
-}
-
-/// The current value from a Get VCP Feature reply, if every byte checks out:
-/// source address, length, reply opcode, no error, the VCP asked for, and the checksum.
-fn reply_value(reply: &[u8; 11], vcp: u8) -> Option<u16> {
-    let ok = reply[0] == DEST
-        && reply[1] == 0x88
-        && reply[2] == 0x02
-        && reply[3] == 0x00
-        && reply[4] == vcp
-        && checksum(HOST, &reply[..10]) == reply[10];
-    ok.then(|| u16::from_be_bytes([reply[8], reply[9]]))
-}
-
-/// Simulated inputs by serial (dry run only). A monitor not yet in the file shows 15.
-fn simulated_inputs() -> HashMap<String, u16> {
-    std::fs::read(support_dir().join("simulated-inputs.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok())
-        .unwrap_or_default()
 }
 
 /// One DDC operation at a time, across the app, the CLI and hooks.
@@ -505,7 +421,7 @@ unsafe fn registry_string(entry: IoObject, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// `hotswitch-sender ddc [get <vcp> [serial] | set <vcp> <value> [serial]]`, for debugging
+/// `hotswitch-sender ddc [set <vcp> <value> [serial]]`, for debugging
 /// and hooks. The plain listing sends nothing to any monitor and says why a monitor can't be
 /// used. The same safety rules apply here as in the app.
 pub fn cli(args: &[String]) {
@@ -533,18 +449,11 @@ pub fn cli(args: &[String]) {
                 }
                 Ok(())
             }
-            [cmd, vcp, rest @ ..] if cmd == "get" && rest.len() <= 1 => {
-                let vcp = parse(vcp).ok_or("bad VCP code")?;
-                open(rest.first())?.read(vcp as u8).map(|v| println!("{v}"))
-            }
             [cmd, vcp, value, rest @ ..] if cmd == "set" && rest.len() <= 1 => {
                 let (vcp, value) = parse(vcp).zip(parse(value)).ok_or("bad arguments")?;
                 open(rest.first())?.write(vcp as u8, value)
             }
-            _ => Err(
-                "usage: hotswitch-sender ddc [get <vcp> [serial] | set <vcp> <value> [serial]]"
-                    .into(),
-            ),
+            _ => Err("usage: hotswitch-sender ddc [set <vcp> <value> [serial]]".into()),
         }
     };
     if let Err(e) = run() {
@@ -568,13 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn get_request_includes_the_source_address() {
-        // m1ddc 7339cee: 0x6E ^ 0x51 ^ 0x82 ^ 0x01 ^ 0x60 = 0xDC, not 0x8D.
-        assert_eq!(get_request(0x60), [0x82, 0x01, 0x60, 0xDC]);
-        assert_eq!(get_request(0x10), [0x82, 0x01, 0x10, 0xAC]);
-    }
-
-    #[test]
     fn set_request_checksum() {
         assert_eq!(
             set_request(0x60, 0x0F),
@@ -584,39 +486,6 @@ mod tests {
             set_request(0x60, 0x11),
             [0x84, 0x03, 0x60, 0x00, 0x11, 0xC9]
         );
-    }
-
-    fn reply(value: u16) -> [u8; 11] {
-        let mut r = [
-            0x6E,
-            0x88,
-            0x02,
-            0x00,
-            0x60,
-            0x00,
-            0x00,
-            0x12,
-            (value >> 8) as u8,
-            value as u8,
-            0,
-        ];
-        r[10] = checksum(HOST, &r[..10]);
-        r
-    }
-
-    #[test]
-    fn reply_validation() {
-        assert_eq!(reply_value(&reply(0x11), 0x60), Some(0x11));
-        assert_eq!(reply_value(&reply(0x11), 0x10), None, "other VCP");
-        for (byte, wrong) in [(0, 0x6F), (1, 0x87), (2, 0x01), (3, 0x01), (10, 0x00)] {
-            let mut r = reply(0x11);
-            r[byte] = wrong;
-            if byte != 10 {
-                r[10] = checksum(HOST, &r[..10]);
-            }
-            assert_eq!(reply_value(&r, 0x60), None, "byte {byte} = {wrong:#x}");
-        }
-        assert_eq!(reply_value(&[0; 11], 0x60), None, "an empty buffer");
     }
 
     #[test]

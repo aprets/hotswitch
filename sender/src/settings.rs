@@ -196,6 +196,11 @@ pub struct Settings {
     pub monitor: Option<String>,
     /// VCP 0x60 value of the PS5's input (0x11 is HDMI 1).
     pub ps5_input: u16,
+    /// VCP 0x60 value the monitor goes back to when PS5 mode ends (0x0F is DisplayPort 1).
+    pub mac_input: u16,
+    /// In PS5 mode, also detach the monitor from macOS with BetterDisplay, as the receiver
+    /// hooks do for the PC, so windows don't land on a screen showing the PS5.
+    pub detach_display: bool,
     /// CoreAudio input that carries the PS5's sound.
     pub audio_input: String,
     /// Shortcut per mode, indexed like `Mode::ALL`.
@@ -215,6 +220,8 @@ impl Default for Settings {
             receiver: None,
             monitor: None,
             ps5_input: 0x11,
+            mac_input: 0x0F,
+            detach_display: true,
             audio_input: "Microphone In".into(),
             hotkeys: [
                 None,
@@ -330,6 +337,8 @@ mod tests {
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), s);
         let partial: Settings = serde_json::from_str(r#"{"receiver":"10.0.0.209:24801"}"#).unwrap();
         assert_eq!(partial.ps5_input, 0x11);
+        assert_eq!(partial.mac_input, 0x0F);
+        assert!(partial.detach_display);
         assert_eq!(partial.audio_input, "Microphone In");
     }
 

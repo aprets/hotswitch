@@ -19,6 +19,7 @@ pub enum Action {
     Receiver(String),
     Monitor(Option<String>),
     Ps5Input(u16),
+    MacInput(u16),
     AudioInput(String),
     RecordHotkey(Mode),
     StartOnLogin(bool),
@@ -68,6 +69,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(macInputChanged:))]
+        fn mac_input_changed(&self, sender: &NSPopUpButton) {
+            if let Some((value, _)) = ddc::INPUTS.get(sender.indexOfSelectedItem() as usize) {
+                (self.ivars().on_action)(Action::MacInput(*value));
+            }
+        }
+
         #[unsafe(method(audioChanged:))]
         fn audio_changed(&self, sender: &NSPopUpButton) {
             let names = self.ivars().audio_names.borrow();
@@ -98,6 +106,7 @@ pub struct SettingsWindow {
     receiver_note: Retained<NSTextField>,
     monitor: Retained<NSPopUpButton>,
     ps5_input: Retained<NSPopUpButton>,
+    mac_input: Retained<NSPopUpButton>,
     audio_input: Retained<NSPopUpButton>,
     hotkeys: Vec<Retained<NSButton>>,
     login: Retained<NSButton>,
@@ -152,8 +161,10 @@ impl SettingsWindow {
 
         let monitor = popup(sel!(monitorChanged:));
         let ps5_input = popup(sel!(inputChanged:));
+        let mac_input = popup(sel!(macInputChanged:));
         for (_, name) in ddc::INPUTS {
             ps5_input.addItemWithTitle(&ns(name));
+            mac_input.addItemWithTitle(&ns(name));
         }
         let audio_input = popup(sel!(audioChanged:));
 
@@ -201,6 +212,7 @@ impl SettingsWindow {
             NSArray::from_retained_slice(&[empty(), view(&receiver_note)]),
             NSArray::from_retained_slice(&[label("Monitor:"), view(&monitor)]),
             NSArray::from_retained_slice(&[label("PS5 input:"), view(&ps5_input)]),
+            NSArray::from_retained_slice(&[label("Mac input:"), view(&mac_input)]),
             NSArray::from_retained_slice(&[label("PS5 audio from:"), view(&audio_input)]),
             NSArray::from_retained_slice(&[label("Switch to Mac:"), view(&hotkeys[0])]),
             NSArray::from_retained_slice(&[label("Switch to PC:"), view(&hotkeys[1])]),
@@ -224,9 +236,9 @@ impl SettingsWindow {
         }
         grid.rowAtIndex(1).setTopPadding(-4.0);
         grid.rowAtIndex(2).setTopPadding(12.0);
-        grid.rowAtIndex(5).setTopPadding(12.0);
-        grid.rowAtIndex(8).setTopPadding(-2.0);
-        grid.rowAtIndex(9).setTopPadding(12.0);
+        grid.rowAtIndex(6).setTopPadding(12.0);
+        grid.rowAtIndex(9).setTopPadding(-2.0);
+        grid.rowAtIndex(10).setTopPadding(12.0);
 
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -267,6 +279,7 @@ impl SettingsWindow {
             receiver_note,
             monitor,
             ps5_input,
+            mac_input,
             audio_input,
             hotkeys,
             login,
@@ -309,21 +322,27 @@ impl SettingsWindow {
         fill(&self.monitor, &titles, selected.unwrap_or(0));
         *self.handler.ivars().monitor_ids.borrow_mut() = ids;
 
-        let input = ddc::INPUTS
-            .iter()
-            .position(|(v, _)| *v == settings.ps5_input)
-            .unwrap_or(0);
-        self.ps5_input.selectItemAtIndex(input as isize);
+        for (popup, value) in [
+            (&self.ps5_input, settings.ps5_input),
+            (&self.mac_input, settings.mac_input),
+        ] {
+            let index = ddc::INPUTS.iter().position(|(v, _)| *v == value);
+            popup.selectItemAtIndex(index.unwrap_or(0) as isize);
+        }
 
+        // Input devices only, one item per name: a popup drops an item whose title repeats,
+        // which shifted every index after it. The saved device stays listed when it's absent.
         let mut names: Vec<String> = passthrough::input_devices()
             .into_iter()
             .map(|(_, name)| name)
             .collect();
+        let mut titles = names.clone();
         if !names.contains(&settings.audio_input) {
             names.push(settings.audio_input.clone());
+            titles.push(format!("{} (not available)", settings.audio_input));
         }
         let selected = names.iter().position(|n| *n == settings.audio_input);
-        fill(&self.audio_input, &names, selected.unwrap_or(0));
+        fill(&self.audio_input, &titles, selected.unwrap_or(0));
         *self.handler.ivars().audio_names.borrow_mut() = names;
 
         for mode in Mode::ALL {

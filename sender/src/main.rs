@@ -1981,6 +1981,8 @@ impl App {
         let _ = self.monitor_jobs.send(Job::Want(Want::Hold {
             monitor: self.settings.monitor.clone(),
             input,
+            restore: self.settings.mac_input,
+            detach: self.settings.detach_display,
         }));
     }
 
@@ -2094,11 +2096,9 @@ impl App {
     fn monitor_result(&mut self, report: Report) {
         self.monitor_line = match report {
             Report::Holding { name, input } => format!("{name} on {}", ddc::input_name(input)),
-            Report::Released {
-                name,
-                input: Some(input),
-            } => format!("{name} back on {}", ddc::input_name(input)),
-            Report::Released { name, input: None } => format!("{name} left as it was"),
+            Report::Released { name, input } => {
+                format!("{name} back on {}", ddc::input_name(input))
+            }
             Report::Refused(e) => e,
             Report::Owed(e) => e,
         };
@@ -2154,6 +2154,10 @@ impl App {
             }
             Action::Ps5Input(input) => {
                 self.settings.ps5_input = input;
+                self.save();
+            }
+            Action::MacInput(input) => {
+                self.settings.mac_input = input;
                 self.save();
             }
             Action::AudioInput(name) => {

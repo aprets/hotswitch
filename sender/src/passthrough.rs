@@ -7,9 +7,8 @@
 //! both units have been stopped and disposed, also when setup fails halfway.
 
 use coreaudio::audio_unit::macos_helpers::{
-    get_audio_device_ids_for_scope, get_default_device_id, get_device_name,
+    get_audio_device_ids, get_default_device_id, get_device_name,
 };
-use coreaudio::audio_unit::Scope;
 use coreaudio::sys;
 use objc2::msg_send;
 use objc2::runtime::AnyClass;
@@ -511,13 +510,21 @@ pub fn watch_devices(on_change: impl Fn() + Send + Sync + 'static) {
     }
 }
 
-/// Input devices as (id, name).
+/// Devices with at least one input stream, as (id, name), one per name (the first wins, as
+/// in `Passthrough::start`). Output-only devices such as a dock's "Headphone" are left out.
 pub fn input_devices() -> Vec<(u32, String)> {
-    get_audio_device_ids_for_scope(Scope::Input)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|id| get_device_name(id).ok().map(|name| (id, name)))
-        .collect()
+    let mut out: Vec<(u32, String)> = Vec::new();
+    for id in get_audio_device_ids().unwrap_or_default() {
+        if first_stream(id, sys::kAudioObjectPropertyScopeInput).is_none() {
+            continue;
+        }
+        if let Ok(name) = get_device_name(id) {
+            if !out.iter().any(|(_, n)| *n == name) {
+                out.push((id, name));
+            }
+        }
+    }
+    out
 }
 
 pub enum MicAccess {

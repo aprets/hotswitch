@@ -83,7 +83,7 @@ The menu bar icon shows the mode: an outline circle (Mac, PC not reachable), a f
 
 ### Settings window
 
-One small window: the Windows receiver address with its connection state underneath, the monitor and input for PS5 mode, the audio input that carries the PS5's sound, a shortcut recorder per mode (click, press the keys; Delete clears, Escape cancels) and `Start Hotswitch at login`.
+One small window: the Windows receiver address with its connection state underneath, the monitor, the PS5's input and the Mac's input for PS5 mode, the audio input that carries the PS5's sound (input devices only), a shortcut recorder per mode (click, press the keys; Delete clears, Escape cancels) and `Start Hotswitch at login`.
 
 ### PS5 mode
 
@@ -91,9 +91,10 @@ The PS5 plugs into the monitor over HDMI. The monitor's 3.5 mm audio out goes in
 
 1. starts a low-latency loop from that input to the default output (two HAL units and a small lock-free ring, 64-frame buffers, +6 dB with a soft limiter, about 13 ms on top of the output device's own latency);
 2. asks for microphone access first if macOS hasn't decided yet, so the prompt shows before the screen goes away;
-3. reads the monitor's current input over DDC/CI. If that read fails, the monitor is not switched. Otherwise it saves a hand-back record and only then switches the monitor to the PS5's input.
+3. saves a hand-back record, then switches the monitor to the PS5's input over DDC/CI;
+4. once the switch has gone through, detaches the monitor from macOS with BetterDisplay, as the PC's receiver hooks do, so windows stay on the other screens. `"detach_display": false` in `settings.json` turns this off.
 
-Leaving PS5 mode stops the loop and hands the monitor back: it reads the input again and restores the saved one only if the monitor still shows the PS5's. If the read fails, the monitor is left alone and the hand-back stays owed. The record (`monitor-claim.json`) keeps the monitor and both inputs as they were at entry, so Settings edits don't change it. It survives a crash, sleep or an unplugged dock and is retried on wake, when displays come back and at the next launch. Quitting waits for it, up to six seconds. Sleep ends PS5 mode; a locked or sleeping screen doesn't.
+Leaving PS5 mode stops the loop and hands the monitor back. It re-attaches the display first, waits two seconds for it to settle, then switches the monitor to the Mac's input (Settings, "Mac input", DisplayPort 1 by default). Nothing reads the monitor: a monitor showing another input can't be trusted to report it. The hand-back record is cleared only after that write succeeds; if a step fails, the hand-back stays owed. The record (`monitor-claim.json`) keeps the monitor, both inputs and whether it detached the display, as they were at entry, so Settings edits don't change it. It survives a crash, sleep or an unplugged dock and is retried on wake, when displays come back and at the next launch. Quitting waits for it, up to six seconds. Sleep ends PS5 mode; a locked or sleeping screen doesn't.
 
 The loop follows the default output. It rebinds both its input and output after audio devices come and go (for example a dock that reboots), once they settle for a second, and restarts if its input stops delivering.
 
@@ -103,12 +104,12 @@ DDC rules:
 - A monitor that could be showing the Mac's main display is never touched. If the main display can't be identified, no monitor is.
 - A monitor is targeted only by a serial number no other monitor shares. Without a saved choice, PS5 mode uses the only usable monitor and refuses when there are several.
 - Before every I2C transaction the display layout is checked again; any change stops the operation.
-- A read is at most two tries, 250 ms apart. A write is sent once. Operations are at least a second apart, queued switches collapse into the latest, and one lock file serializes DDC across the app, the CLI and hooks. Nothing polls the monitor.
+- DDC only writes, each write sent once. Operations are at least a second apart, queued switches collapse into the latest, and one lock file serializes DDC across the app, the CLI and hooks. Nothing reads or polls the monitor.
 
-`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc get <vcp> [serial]` and `ddc set <vcp> <value> [serial]` follow the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.
+`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc set <vcp> <value> [serial]` follows the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.
 
 A dry run (`open --env HOTSWITCH_DRY_RUN=1 Hotswitch.app`) tries modes and hand-back without touching hardware:
-- no DDC service is ever opened, and monitor inputs are simulated in a file;
+- no DDC service is ever opened, and DDC writes and BetterDisplay calls are only logged;
 - hooks don't run, and the login item isn't touched;
 - settings, the hand-back record and the log are kept apart, under `Application Support/Hotswitch/dry-run/` and `hotswitch-sender-dry-run.log`;
 - the menu bar shows "DRY RUN", and the menu starts with "Dry run: monitors simulated, hooks off".
