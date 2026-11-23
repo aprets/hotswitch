@@ -42,21 +42,27 @@ impl Switch {
             eprintln!("hdmi switch dry run: would select {output}");
             return Ok(());
         }
-        let mut last = "no address configured".to_string();
+        let mut errors = Vec::new();
         for url in &self.config.urls {
             let response = self
                 .client
                 .post(format!("{url}/select/HDMI%20input/set?option={output}"))
                 .basic_auth(&self.config.user, Some(&self.config.password))
+                // ESPHome answers a POST without a length with 411 Length Required, and
+                // reqwest sends none for an empty body.
+                .header(reqwest::header::CONTENT_LENGTH, "0")
                 .timeout(Duration::from_secs(3))
                 .send();
             match response {
                 Ok(r) if r.status().is_success() => return Ok(()),
-                Ok(r) => last = format!("{url}: HTTP {}", r.status()),
-                Err(e) => last = format!("{url}: {e}"),
+                Ok(r) => errors.push(format!("{url}: HTTP {}", r.status())),
+                Err(e) => errors.push(format!("{url}: {}", causes(&e))),
             }
         }
-        Err(last)
+        if errors.is_empty() {
+            errors.push("no address configured".into());
+        }
+        Err(errors.join("; "))
     }
 
     /// Follow the event stream forever, calling `on_output` with the live output whenever it
@@ -92,7 +98,7 @@ impl Switch {
                 return false;
             }
             Err(e) => {
-                eprintln!("hdmi switch: {url}: {e}");
+                eprintln!("hdmi switch: {url}: {}", causes(&e));
                 return false;
             }
         };
@@ -109,6 +115,18 @@ impl Switch {
         eprintln!("hdmi switch: {url} stream ended");
         true
     }
+}
+
+/// An error with its sources: reqwest's own text ("error sending request") hides the cause.
+fn causes(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        text.push_str(": ");
+        text.push_str(&s.to_string());
+        source = s.source();
+    }
+    text
 }
 
 /// Wait before reconnecting: 1 s after a stream that worked, doubling to 30 s while failing.
@@ -243,6 +261,7 @@ mod tests {
             head.contains("authorization: basic ag90c3dpdgnoonb3"),
             "{head}"
         );
+        assert!(head.contains("content-length: 0"), "{head}");
     }
 
     #[test]
@@ -252,6 +271,24 @@ mod tests {
         assert_eq!(switch(vec![dead.clone(), url]).select("B"), Ok(()));
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert!(switch(vec![dead]).select("B").is_err());
+    }
+
+    #[test]
+    fn select_reports_why_each_address_failed() {
+        let (url, _) = serve(vec![
+            "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n".into(),
+        ]);
+        let dead = "http://127.0.0.1:1".to_string();
+        let error = switch(vec![url.clone(), dead.clone()])
+            .select("B")
+            .unwrap_err();
+        assert!(error.contains(&format!("{url}: HTTP 411")), "{error}");
+        // The cause, not just reqwest's "error sending request".
+        assert!(
+            error.contains(&format!("{dead}: error sending request")),
+            "{error}"
+        );
+        assert!(error.to_lowercase().contains("refused"), "{error}");
     }
 
     #[test]

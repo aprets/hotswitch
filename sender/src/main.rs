@@ -38,7 +38,8 @@ use objc2_foundation::{
 };
 use passthrough::{MicAccess, Passthrough};
 use settings::{
-    parse_receiver_address, AudioRoute, Hotkey, Mode, Settings, KEY_DELETE, KEY_ESCAPE,
+    parse_receiver_address, AudioRoute, Hotkey, Mode, MonitorControl, Settings, KEY_DELETE,
+    KEY_ESCAPE,
 };
 use settings_window::{Action, SettingsWindow};
 use std::{
@@ -636,6 +637,27 @@ fn hooks_dir() -> PathBuf {
 
 fn hook_path(kind: HookKind) -> PathBuf {
     hooks_dir().join(kind.filename())
+}
+
+/// Sleep or wake this Mac's display. Asleep, it drops its signal, so a monitor on input
+/// auto-select moves to the live one: the PS5. Waking is what a keypress does.
+fn set_display_asleep(asleep: bool) {
+    let (cmd, args): (&str, &[&str]) = if asleep {
+        ("/usr/bin/pmset", &["displaysleepnow"])
+    } else {
+        ("/usr/bin/caffeinate", &["-u", "-t", "2"])
+    };
+    if settings::dry_run() {
+        eprintln!("display dry run: would run {cmd} {}", args.join(" "));
+        return;
+    }
+    eprintln!("display: {}", if asleep { "sleep" } else { "wake" });
+    match std::process::Command::new(cmd).args(args).spawn() {
+        Ok(mut child) => {
+            thread::spawn(move || child.wait());
+        }
+        Err(e) => eprintln!("display: {cmd}: {e}"),
+    }
 }
 
 fn run_hook(kind: HookKind, wait: bool, args: &[&str]) {
@@ -2104,6 +2126,12 @@ impl App {
             }
             // The worker hands back whatever it holds, using the claim's own monitor and inputs.
             None => {
+                if from == Mode::Ps5
+                    && self.settings.monitor_control == MonitorControl::DisplaySleep
+                {
+                    self.monitor_line.clear();
+                    set_display_asleep(false);
+                }
                 let _ = self.monitor_jobs.send(Job::Want(Want::Release));
             }
         }
@@ -2128,13 +2156,22 @@ impl App {
 
     /// The monitor and input are fixed here; later Settings edits don't change this request.
     fn take_monitor(&mut self, input: u16) {
-        self.monitor_line = format!("Switching to {}…", ddc::input_name(input));
-        let _ = self.monitor_jobs.send(Job::Want(Want::Hold {
-            monitor: self.settings.monitor.clone(),
-            input,
-            restore: self.settings.mac_input,
-            detach: self.settings.detach_display,
-        }));
+        match self.settings.monitor_control {
+            MonitorControl::Ddc => {
+                self.monitor_line = format!("Switching to {}…", ddc::input_name(input));
+                let _ = self.monitor_jobs.send(Job::Want(Want::Hold {
+                    monitor: self.settings.monitor.clone(),
+                    input,
+                    restore: self.settings.mac_input,
+                    detach: self.settings.detach_display,
+                }));
+            }
+            MonitorControl::DisplaySleep => {
+                self.monitor_line = "Display asleep for the PS5".into();
+                set_display_asleep(true);
+            }
+            MonitorControl::None => self.monitor_line.clear(),
+        }
     }
 
     fn wants_passthrough(&self) -> bool {
@@ -2436,6 +2473,9 @@ impl App {
             eprintln!(
                 "monitor: hand-back still running at {reason}; it is owed to the next launch"
             );
+        }
+        if self.mode == Mode::Ps5 && self.settings.monitor_control == MonitorControl::DisplaySleep {
+            set_display_asleep(false);
         }
         if self.mode == Mode::Ps5 || self.entering_ps5.take().is_some() {
             self.release_switch(true);

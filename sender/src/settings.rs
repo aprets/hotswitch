@@ -201,6 +201,8 @@ pub struct Settings {
     /// In PS5 mode, also detach the monitor from macOS with BetterDisplay, as the receiver
     /// hooks do for the PC, so windows don't land on a screen showing the PS5.
     pub detach_display: bool,
+    /// How PS5 mode puts the PS5 on the monitor.
+    pub monitor_control: MonitorControl,
     /// CoreAudio input that carries the PS5's sound. Empty: PS5 mode plays no audio.
     pub audio_input: String,
     /// Shortcut per mode, indexed like `Mode::ALL`.
@@ -209,6 +211,20 @@ pub struct Settings {
     pub modes: Vec<Mode>,
     /// The HDMI switch that sends the PS5 to one desk at a time. None: no switch.
     pub hdmi_switch: Option<HdmiSwitch>,
+}
+
+/// How PS5 mode puts the PS5 on the monitor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorControl {
+    /// Switch the monitor's input over DDC/CI.
+    #[default]
+    Ddc,
+    /// For a monitor without DDC/CI on input auto-select: sleep this Mac's display, so its
+    /// signal drops and the monitor finds the PS5 by itself. Leaving wakes it again.
+    DisplaySleep,
+    /// Leave the monitor alone.
+    None,
 }
 
 /// How to reach the HDMI switch, and which of its outputs feeds this Mac's monitor.
@@ -238,6 +254,7 @@ impl Default for Settings {
             ps5_input: 0x11,
             mac_input: 0x0F,
             detach_display: true,
+            monitor_control: MonitorControl::Ddc,
             audio_input: "Microphone In".into(),
             hotkeys: [
                 None,
@@ -369,6 +386,7 @@ mod tests {
         assert_eq!(partial.ps5_input, 0x11);
         assert_eq!(partial.mac_input, 0x0F);
         assert!(partial.detach_display);
+        assert_eq!(partial.monitor_control, MonitorControl::Ddc);
         assert_eq!(partial.audio_input, "Microphone In");
         assert!(partial.has_mode(Mode::Windows) && partial.hdmi_switch.is_none());
         let shui: Settings = serde_json::from_str(r#"{"modes":["ps5"]}"#).unwrap();
@@ -376,6 +394,9 @@ mod tests {
         assert!(!shui.has_mode(Mode::Windows));
         let no_audio: Settings = serde_json::from_str(r#"{"audio_input":""}"#).unwrap();
         assert!(no_audio.audio_route(Mode::Ps5).is_none());
+        let sleep: Settings =
+            serde_json::from_str(r#"{"monitor_control":"display_sleep"}"#).unwrap();
+        assert_eq!(sleep.monitor_control, MonitorControl::DisplaySleep);
     }
 
     #[test]
