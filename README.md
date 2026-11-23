@@ -2,6 +2,12 @@
 
 Minimal software KVM for sharing a Mac's keyboard and mouse with a Windows PC over LAN. Press a hotkey to send input to the PC, press again to reclaim it. Built for low-latency use. Raw input over unencrypted UDP, no video or screen sharing.
 
+On the Mac it is a menu bar mode switcher with three modes:
+
+- **Mac**: keyboard, mouse and screen stay with the Mac. The default.
+- **Windows PC**: keyboard and mouse go to the Windows receiver, and its sound comes back over UDP.
+- **PS5**: a monitor switches to the PS5's input over DDC/CI, and the PS5's sound plays through the Mac. Keyboard and mouse stay with the Mac; the PS5 has its own controller.
+
 ## How it works
 
 ```text
@@ -21,11 +27,10 @@ Audio flows in the reverse direction: the receiver captures Windows system audio
 The preferred macOS install is `Hotswitch.app`.
 
 1. Drag `Hotswitch.app` into `/Applications`.
-2. Launch it once.
-3. If no receiver address is saved yet, the app prompts for the Windows receiver address in `IP:port` form.
-4. Use the tray item `Receiver Address...` any time you want to change it later.
+2. Launch it and allow Accessibility when macOS asks (needed for the keyboard and mouse tap and the shortcuts).
+3. Open `Settings…` from the menu and enter the Windows receiver address in `IP:port` form.
 
-`Start on Login` launches the app bundle directly and uses the saved receiver address. No command-line arguments are required once the address has been saved.
+Settings live in `~/Library/Application Support/Hotswitch/settings.json`. The first run imports the address from the old `receiver-address.txt`. `Start Hotswitch at login` launches the app bundle directly; no command-line arguments are needed.
 
 The macOS release archive also includes the bare `hotswitch-sender` binary for development/debugging, but the app bundle is the normal install path.
 
@@ -59,19 +64,54 @@ hotswitch-receiver.exe 0.0.0.0:24801
 
 ## Controls
 
-- `Ctrl+Escape`: toggle capture
+- `⌃⎋` (Control+Escape): Windows PC mode, press again for Mac. It now matches exactly, so Control+Shift+Escape no longer toggles.
+- `⌃⌥⎋` (Control+Option+Escape): PS5 mode, press again for Mac.
+- Every mode, Mac included, can have its own shortcut in Settings. Pressing the shortcut of the mode you are in goes back to Mac.
 - Both sides run as tray apps with status icons and menus
 
 ## Tray menu
 
 ### macOS sender
 
-- Status line
-- Check for Updates
-- Receiver Address...
-- Show Log
-- Start on Login
-- Quit
+- The three modes, with a check on the current one and each mode's shortcut. Windows PC is greyed out while the receiver isn't reachable.
+- In PS5 mode only, three status lines: the monitor and its input ("XV275K P3 on HDMI 1"), the signal level ("Signal -21 dB" or "No signal"), and the route ("Microphone In → AirPods · 13 ms").
+- The PC's state: connected, not reachable, or no address set.
+- `Allow Accessibility Access…`, only while macOS hasn't granted it.
+- `Settings…`, `Show Log`, `Check for Updates`, `Quit Hotswitch`.
+
+The menu bar icon shows the mode: an outline circle (Mac, PC not reachable), a filled circle (Mac, PC connected), yellow (Windows PC) or blue (PS5).
+
+### Settings window
+
+One small window: the Windows receiver address with its connection state underneath, the monitor, the PS5's input and the Mac's input for PS5 mode, the audio input that carries the PS5's sound (input devices only), a shortcut recorder per mode (click, press the keys; Delete clears, Escape cancels) and `Start Hotswitch at login`.
+
+### PS5 mode
+
+The PS5 plugs into the monitor over HDMI. The monitor's 3.5 mm audio out goes into a line or microphone input on the Mac, for example a dock's "Microphone In". Entering PS5 mode:
+
+1. starts a low-latency loop from that input to the default output (two HAL units and a small lock-free ring, 64-frame buffers, +6 dB with a soft limiter, about 13 ms on top of the output device's own latency);
+2. asks for microphone access first if macOS hasn't decided yet, so the prompt shows before the screen goes away;
+3. saves a hand-back record, then switches the monitor to the PS5's input over DDC/CI;
+4. once the switch has gone through, detaches the monitor from macOS with BetterDisplay, as the PC's receiver hooks do, so windows stay on the other screens. `"detach_display": false` in `settings.json` turns this off.
+
+Leaving PS5 mode stops the loop and hands the monitor back. It re-attaches the display first, waits two seconds for it to settle, then switches the monitor to the Mac's input (Settings, "Mac input", DisplayPort 1 by default). Nothing reads the monitor: a monitor showing another input can't be trusted to report it. The hand-back record is cleared only after that write succeeds; if a step fails, the hand-back stays owed. The record (`monitor-claim.json`) keeps the monitor, both inputs and whether it detached the display, as they were at entry, so Settings edits don't change it. It survives a crash, sleep or an unplugged dock and is retried on wake, when displays come back and at the next launch. Quitting waits for it, up to six seconds. Sleep ends PS5 mode; a locked or sleeping screen doesn't.
+
+The loop follows the default output. It rebinds both its input and output after audio devices come and go (for example a dock that reboots), once they settle for a second, and restarts if its input stops delivering.
+
+DDC rules:
+
+- Monitors are found from the IORegistry only, with no EDID or I2C traffic.
+- PS5 mode switches only the monitor saved in Settings, by a serial no other monitor shares. It never picks one on its own; with none saved, the menu says "Choose the PS5 monitor in Settings". The saved monitor may be the main display: detaching it moves the main display elsewhere, as the PC's receiver hooks do.
+- Before every I2C transaction the monitors are looked up again; if the serial no longer maps to the same display port, the operation stops.
+- DDC only writes, each write sent once. Operations are at least a second apart, queued switches collapse into the latest, and one lock file serializes DDC across the app, the CLI and hooks. Nothing reads or polls the monitor.
+
+`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc set <vcp> <value> <serial>` follows the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.
+
+A dry run (`open --env HOTSWITCH_DRY_RUN=1 Hotswitch.app`) tries modes and hand-back without touching hardware:
+- no DDC service is ever opened, and DDC writes and BetterDisplay calls are only logged;
+- hooks don't run, and the login item isn't touched;
+- settings, the hand-back record and the log are kept apart, under `Application Support/Hotswitch/dry-run/` and `hotswitch-sender-dry-run.log`;
+- the menu bar shows "DRY RUN", and the menu starts with "Dry run: monitors simulated, hooks off".
 
 ### macOS hooks
 
@@ -83,6 +123,8 @@ The sender runs optional executable hook scripts from:
 
 - `on-receiver-connected`: runs when the sender first sees the receiver.
 - `on-receiver-disconnected`: runs when the receiver disappears, the sender quits, or the sender relaunches for an update/address change after having connected.
+
+- `on-mode-changed <from> <to>`: runs on every mode change, with `mac`, `windows` or `ps5`.
 
 Hooks run asynchronously during normal connection changes and are logged in `~/Library/Logs/hotswitch-sender.log`. Quit and relaunch cleanup waits for the disconnect hook to finish.
 
@@ -113,6 +155,8 @@ cargo build --release -p hotswitch-receiver-service
 # Protocol tests (any platform)
 cargo test -p hotswitch-proto
 ```
+
+`build-sender-app.sh` signs the bundle with hardened runtime and `sender/macos/Hotswitch.entitlements` (audio input), using `$HOTSWITCH_SIGN_IDENTITY` or else the first "Apple Development" identity in the keychain. A stable signature keeps the Accessibility and Microphone permissions across rebuilds. An Apple Development certificate is only good on your own Macs; giving the app to anyone else needs a Developer ID certificate and notarization. CI signs releases with the self-signed "Hotswitch" certificate, also with hardened runtime and the same entitlements.
 
 ## Releasing
 

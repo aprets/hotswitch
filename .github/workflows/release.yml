@@ -26,7 +26,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - shell: bash
         run: sed -i '' "1,5s/^version = \".*\"/version = \"${{ steps.v.outputs.version }}\"/" sender/Cargo.toml
-      - run: cargo test -p hotswitch-proto
+      - run: cargo test -p hotswitch-proto -p hotswitch-sender
       - run: cargo build --release -p hotswitch-sender
       - run: ./scripts/build-sender-app.sh target/release/hotswitch-sender "${{ steps.v.outputs.version }}" "$RUNNER_TEMP/macos-bundle"
       - name: Sign macOS binary
@@ -43,8 +43,17 @@ jobs:
           security import /tmp/cert.p12 -k build.keychain -P "$CERT_PASS" -T /usr/bin/codesign
           sudo security add-trusted-cert -d -r trustRoot -k build.keychain /tmp/cert.pem
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
-          codesign -s "Hotswitch" -f target/release/hotswitch-sender
-          codesign -s "Hotswitch" -f --deep "$RUNNER_TEMP/macos-bundle/Hotswitch.app"
+          # Hardened runtime plus the audio-input entitlement, as build-sender-app.sh signs locally.
+          entitlements=sender/macos/Hotswitch.entitlements
+          codesign -s "Hotswitch" -f --options runtime --entitlements "$entitlements" target/release/hotswitch-sender
+          codesign -s "Hotswitch" -f --options runtime --entitlements "$entitlements" "$RUNNER_TEMP/macos-bundle/Hotswitch.app"
+          codesign --verify --strict "$RUNNER_TEMP/macos-bundle/Hotswitch.app"
+          # Fail unless both artifacts have hardened runtime and audio-input set to true.
+          for artifact in target/release/hotswitch-sender "$RUNNER_TEMP/macos-bundle/Hotswitch.app"; do
+            codesign -dv "$artifact" 2>&1 | grep -qE "flags=0x[0-9a-f]+\([^)]*runtime"
+            codesign -d --entitlements - --xml "$artifact" > "$RUNNER_TEMP/entitlements.plist"
+            test "$(/usr/libexec/PlistBuddy -c "Print :com.apple.security.device.audio-input" "$RUNNER_TEMP/entitlements.plist")" = true
+          done
       - run: |
           mkdir -p "$RUNNER_TEMP/macos-release"
           cp target/release/hotswitch-sender "$RUNNER_TEMP/macos-release/"
