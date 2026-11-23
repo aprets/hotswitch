@@ -3,11 +3,11 @@
 //!
 //! Safety rules, because monitors behind a dock can drop off when pushed:
 //! - discovery reads IORegistry properties only, with no EDID or I2C traffic;
-//! - a monitor that could be showing the Mac's main display is never touched, and when the
-//!   main display can't be identified, no monitor is;
-//! - a monitor is targeted only by a serial number that no other monitor shares;
-//! - before every single I2C transaction the display layout is read again, and the operation
-//!   stops if anything changed since the target was opened;
+//! - a monitor is targeted only by a serial saved by the user, which no other monitor shares.
+//!   Whether it is the main display doesn't matter: the PS5 monitor usually is, and detaching
+//!   it moves the main display elsewhere, as the PC's receiver hooks already do;
+//! - before every single I2C transaction the monitors are looked up again, and the operation
+//!   stops if the serial no longer maps to the same display port;
 //! - one DDC operation at a time across processes (a lock file); only writes, each sent once.
 //!   Nothing reads the monitor: one showing another input can't be trusted to answer.
 //!
@@ -19,7 +19,6 @@ use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
-use core_graphics::display::CGDisplay;
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_char, c_void, CStr};
 use std::fs::File;
@@ -93,57 +92,26 @@ pub struct Identity {
     pub product: i64,
 }
 
-/// The main display as CoreGraphics sees it: vendor, model, serial.
-pub type MainDisplay = (i64, i64, i64);
-
 impl Identity {
-    /// Same model as the main display, and the serials don't tell them apart.
-    fn could_be(&self, (vendor, product, serial): MainDisplay) -> bool {
-        self.vendor == vendor
-            && self.product == product
-            && (self.serial_number == serial || self.serial_number == 0 || serial == 0)
-    }
-
     pub fn label(&self) -> String {
         format!("{} · {}", self.name, self.serial)
     }
 }
 
-/// Whether DDC may touch this monitor at all, given the main display.
-pub fn usable(main: Option<MainDisplay>, id: &Identity) -> Result<(), String> {
-    let Some(main) = main else {
-        return Err("the main display can't be identified, so no monitor is touched".into());
-    };
-    if id.serial.is_empty() {
-        return Err(format!(
-            "{} has no serial number, so it can't be told apart",
-            id.name
-        ));
-    }
-    if id.could_be(main) {
-        return Err(format!("{} could be the main display", id.name));
-    }
-    Ok(())
-}
-
-/// Monitors that can be targeted: usable, and the only one with their serial.
-pub fn targetable(main: Option<MainDisplay>, found: &[Identity]) -> Vec<Identity> {
+/// Monitors that can be targeted: they have a serial, and no other monitor shares it.
+pub fn targetable(found: &[Identity]) -> Vec<Identity> {
     found
         .iter()
-        .filter(|id| usable(main, id).is_ok())
+        .filter(|id| !id.serial.is_empty())
         .filter(|id| found.iter().filter(|o| o.serial == id.serial).count() == 1)
         .cloned()
         .collect()
 }
 
-/// The monitor saved for PS5 mode, if it can be switched right now. Never picks one on its
-/// own: with no serial saved it refuses, because the main display can move to any monitor.
-pub fn resolve(
-    main: Option<MainDisplay>,
-    found: &[Identity],
-    wanted: Option<&str>,
-) -> Result<Identity, String> {
-    let Some(serial) = wanted else {
+/// The monitor saved for PS5 mode. Never picks one on its own: with no serial saved it
+/// refuses, since any monitor could be the wrong one.
+pub fn resolve(found: &[Identity], wanted: Option<&str>) -> Result<Identity, String> {
+    let Some(serial) = wanted.filter(|s| !s.is_empty()) else {
         return Err("Choose the PS5 monitor in Settings".into());
     };
     let mut matches = found.iter().filter(|id| id.serial == serial);
@@ -153,31 +121,19 @@ pub fn resolve(
     if matches.next().is_some() {
         return Err(format!("Another monitor shares serial {serial}"));
     }
-    usable(main, id)?;
     Ok(id.clone())
 }
 
-/// What decides whether a running DDC operation may continue. Compared before every transaction.
+/// Which monitor sits on which display port. Compared before every transaction, so a write
+/// never reaches a different monitor than the one opened.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
-    main: Option<MainDisplay>,
-    main_id: u32,
-    active: Vec<u32>,
     /// (framebuffer port like "dispext0", identity), sorted.
     framebuffers: Vec<(String, Identity)>,
 }
 
 impl Layout {
     pub fn read() -> Layout {
-        let main = CGDisplay::main();
-        let (vendor, product, serial) = (
-            main.vendor_number() as i64,
-            main.model_number() as i64,
-            main.serial_number() as i64,
-        );
-        let known = main.id != 0 && !(vendor == 0 && product == 0);
-        let mut active = CGDisplay::active_displays().unwrap_or_default();
-        active.sort_unstable();
         let mut framebuffers = Vec::new();
         unsafe {
             for_each_service(c"IOMobileFramebufferShim", |entry| {
@@ -187,16 +143,7 @@ impl Layout {
             });
         }
         framebuffers.sort_by(|a, b| a.0.cmp(&b.0));
-        Layout {
-            main: known.then_some((vendor, product, serial)),
-            main_id: main.id,
-            active,
-            framebuffers,
-        }
-    }
-
-    pub fn main(&self) -> Option<MainDisplay> {
-        self.main
+        Layout { framebuffers }
     }
 
     /// Monitors with a DDC service (registry only).
@@ -213,7 +160,7 @@ impl Layout {
     }
 
     pub fn targetable(&self) -> Vec<Identity> {
-        targetable(self.main, &self.found())
+        targetable(&self.found())
     }
 
     unsafe fn proxy_identity(&self, entry: IoObject) -> Option<&Identity> {
@@ -249,12 +196,11 @@ impl Drop for Target {
 }
 
 impl Target {
-    /// Open `identity` for DDC if it is usable now and the only monitor with its serial.
+    /// Open `identity` for DDC if it is connected and the only monitor with its serial.
     pub fn open(identity: &Identity) -> Result<Target, String> {
         let lock = lock()?;
         let layout = Layout::read();
         if !layout.targetable().contains(identity) {
-            usable(layout.main, identity)?;
             return Err(format!(
                 "{} isn't connected, or another monitor shares its serial",
                 identity.name
@@ -426,8 +372,8 @@ unsafe fn registry_string(entry: IoObject, key: &str) -> Option<String> {
 }
 
 /// `hotswitch-sender ddc [set <vcp> <value> <serial>]`, for debugging
-/// and hooks. The plain listing sends nothing to any monitor and says why a monitor can't be
-/// used. The same safety rules apply here as in the app.
+/// and hooks. The plain listing sends nothing to any monitor and says which monitors can be
+/// targeted. The same rules apply here as in the app.
 pub fn cli(args: &[String]) {
     let parse = |s: &str| match s.strip_prefix("0x") {
         Some(hex) => u16::from_str_radix(hex, 16).ok(),
@@ -435,23 +381,18 @@ pub fn cli(args: &[String]) {
     };
     let open = |serial: Option<&String>| -> Result<Target, String> {
         let layout = Layout::read();
-        Target::open(&resolve(
-            layout.main(),
-            &layout.found(),
-            serial.map(String::as_str),
-        )?)
+        Target::open(&resolve(&layout.found(), serial.map(String::as_str))?)
     };
     let run = || -> Result<(), String> {
         match args {
             [] => {
-                let layout = Layout::read();
-                let found = layout.found();
-                let targetable = targetable(layout.main(), &found);
+                let found = Layout::read().found();
+                let targetable = targetable(&found);
                 for id in &found {
-                    let note = match usable(layout.main(), id) {
-                        Err(e) => format!("not used: {e}"),
-                        Ok(()) if !targetable.contains(id) => "not used: serial not unique".into(),
-                        Ok(()) => "usable".into(),
+                    let note = match () {
+                        _ if id.serial.is_empty() => "not used: no serial",
+                        _ if !targetable.contains(id) => "not used: serial not unique",
+                        _ => "usable",
                     };
                     println!("{}\tserial {}\t{note}", id.name, id.serial);
                 }
@@ -497,70 +438,35 @@ mod tests {
     }
 
     #[test]
-    fn main_display_guard() {
-        let m = monitor("TEST0001", 12345678);
-        assert!(
-            usable(None, &m).is_err(),
-            "unknown main display touches nothing"
-        );
-        assert!(
-            usable(Some((4242, 1001, 12345678)), &m).is_err(),
-            "is the main display"
-        );
-        assert!(
-            usable(Some((4242, 1001, 0)), &m).is_err(),
-            "main has no serial"
-        );
-        assert!(
-            usable(Some((4242, 1001, 87654321)), &m).is_ok(),
-            "a twin with another serial"
-        );
-        assert!(
-            usable(Some((4242, 1002, 12345678)), &m).is_ok(),
-            "another model"
-        );
-        let no_serial = monitor("", 0);
-        assert!(
-            usable(Some((1, 2, 3)), &no_serial).is_err(),
-            "no serial at all"
-        );
-        assert!(
-            usable(Some((4242, 1001, 87654321)), &monitor("X", 0)).is_err(),
-            "twin, numeric serial missing"
-        );
+    fn duplicate_or_missing_serials_are_never_targets() {
+        let found = [
+            monitor("SAME", 1),
+            monitor("SAME", 2),
+            monitor("OTHER", 3),
+            monitor("", 0),
+        ];
+        assert_eq!(targetable(&found), vec![monitor("OTHER", 3)]);
+        assert!(resolve(&found, Some("SAME")).is_err());
+        assert!(resolve(&found, Some("")).is_err());
+        assert!(resolve(&found, Some("MISSING")).is_err());
+        assert_eq!(resolve(&found, Some("OTHER")), Ok(monitor("OTHER", 3)));
     }
 
     #[test]
-    fn duplicate_serials_are_never_targets() {
-        let main = Some((1, 2, 3));
-        let found = [monitor("SAME", 1), monitor("SAME", 2), monitor("OTHER", 3)];
-        assert_eq!(targetable(main, &found), vec![monitor("OTHER", 3)]);
-        assert!(resolve(main, &found, Some("SAME")).is_err());
-        assert_eq!(
-            resolve(main, &found, Some("OTHER")),
-            Ok(monitor("OTHER", 3))
-        );
-        assert!(resolve(main, &found, Some("MISSING")).is_err());
-    }
-
-    #[test]
-    fn ps5_mode_never_picks_a_monitor_on_its_own() {
-        // 23 Nov: macOS moved the main display to the PS5 monitor, leaving its twin as the only
-        // usable monitor. With no serial saved, that twin (the wrong screen) must not be picked.
+    fn ps5_mode_targets_exactly_the_saved_monitor() {
+        // 23 Nov: with nothing saved, the only other candidate was the wrong screen. Never guess.
         let ps5 = monitor("PS5MON", 111);
-        let other = monitor("OTHERMON", 222);
-        let found = [ps5.clone(), other.clone()];
-        let ps5_is_main = Some((4242, 1001, 111));
-        assert_eq!(targetable(ps5_is_main, &found), vec![other.clone()]);
+        let found = [ps5.clone(), monitor("OTHERMON", 222)];
         assert_eq!(
-            resolve(ps5_is_main, &found, None),
+            resolve(&found, None),
             Err("Choose the PS5 monitor in Settings".into())
         );
-        // Saved, but showing the menu bar right now: refused, with the reason.
-        let refused = resolve(ps5_is_main, &found, Some("PS5MON")).unwrap_err();
-        assert!(refused.contains("main display"), "{refused}");
-        // Saved, and the other monitor is the main display: fine.
-        let other_is_main = Some((4242, 1001, 222));
-        assert_eq!(resolve(other_is_main, &found, Some("PS5MON")), Ok(ps5));
+        assert_eq!(
+            resolve(&[ps5.clone()], None),
+            Err("Choose the PS5 monitor in Settings".into())
+        );
+        // The saved monitor is used whether or not it shows the menu bar: in Artur's setup the
+        // PS5 monitor usually is the main display.
+        assert_eq!(resolve(&found, Some("PS5MON")), Ok(ps5));
     }
 }

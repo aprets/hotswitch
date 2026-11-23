@@ -292,28 +292,17 @@ impl SettingsWindow {
             .setStringValue(&ns(settings.receiver.as_deref().unwrap_or("")));
         self.set_receiver_note(pc_status, false);
 
-        // Every monitor with its own serial (registry only, nothing is sent), marked when it
-        // can't be switched right now. Nothing is chosen until a monitor is saved.
-        let layout = ddc::Layout::read();
-        let found = layout.found();
+        // Every monitor with its own serial (registry only, nothing is sent). Nothing is
+        // chosen until a monitor is saved.
         let mut ids: Vec<Option<String>> = Vec::new();
         let mut titles: Vec<String> = Vec::new();
         if settings.monitor.is_none() {
             ids.push(None);
             titles.push("Choose a monitor".into());
         }
-        for m in &found {
-            if m.serial.is_empty() || found.iter().filter(|o| o.serial == m.serial).count() > 1 {
-                continue;
-            }
+        for m in ddc::Layout::read().targetable() {
             ids.push(Some(m.serial.clone()));
-            titles.push(match ddc::usable(layout.main(), m) {
-                Ok(()) => m.label(),
-                Err(_) if layout.main().is_none() => {
-                    format!("{} (main display unknown)", m.label())
-                }
-                Err(_) => format!("{} (main display now)", m.label()),
-            });
+            titles.push(m.label());
         }
         if let Some(saved) = &settings.monitor {
             if !ids.contains(&Some(saved.clone())) {

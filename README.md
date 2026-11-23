@@ -101,9 +101,8 @@ The loop follows the default output. It rebinds both its input and output after 
 DDC rules:
 
 - Monitors are found from the IORegistry only, with no EDID or I2C traffic.
-- A monitor that could be showing the Mac's main display is never touched. If the main display can't be identified, no monitor is.
-- A monitor is targeted only by a serial number no other monitor shares. PS5 mode never picks a monitor on its own: it switches only the one saved in Settings, and refuses (saying why in the menu) while that monitor is the main display, because macOS can move the main display to any monitor.
-- Before every I2C transaction the display layout is checked again; any change stops the operation.
+- PS5 mode switches only the monitor saved in Settings, by a serial no other monitor shares. It never picks one on its own; with none saved, the menu says "Choose the PS5 monitor in Settings". The saved monitor may be the main display: detaching it moves the main display elsewhere, as the PC's receiver hooks do.
+- Before every I2C transaction the monitors are looked up again; if the serial no longer maps to the same display port, the operation stops.
 - DDC only writes, each write sent once. Operations are at least a second apart, queued switches collapse into the latest, and one lock file serializes DDC across the app, the CLI and hooks. Nothing reads or polls the monitor.
 
 `hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc set <vcp> <value> <serial>` follows the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.

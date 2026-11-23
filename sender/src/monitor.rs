@@ -41,7 +41,7 @@ pub struct Claim {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Want {
     Release,
-    /// Hold `input` on the monitor with this serial (or the only usable one) and write `restore`
+    /// Hold `input` on the monitor with this serial (none saved: refused) and write `restore`
     /// on release. `detach` also detaches the display from macOS. All fixed when sent.
     Hold {
         monitor: Option<String>,
@@ -151,7 +151,7 @@ impl Monitors for Hardware {
     fn resolve(&mut self, wanted: Option<&str>) -> Result<Identity, String> {
         // Registry only: no DDC until the target is settled.
         let layout = Layout::read();
-        ddc::resolve(layout.main(), &layout.found(), wanted)
+        ddc::resolve(&layout.found(), wanted)
     }
 
     fn open(&mut self, identity: &Identity) -> Result<Box<dyn InputPort>, String> {
