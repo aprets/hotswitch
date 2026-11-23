@@ -37,6 +37,11 @@ struct Ring {
     reprime: AtomicBool,
     /// Input peak since the last status read, as f32 bits.
     peak: AtomicU32,
+    /// For the log: per-channel input peaks since the last meter read, the left channel's
+    /// DC offset, and samples at full scale.
+    meter: [AtomicU32; 2],
+    dc: AtomicU32,
+    clipped: AtomicU32,
 }
 
 /// An output-type audio unit, stopped and disposed when dropped.
@@ -112,6 +117,9 @@ struct InputState {
     buffer: Box<[f32]>,
     ring: Arc<Ring>,
     gain: f32,
+    /// A one-channel input plays in both ears: the unit fills only the left.
+    mono: bool,
+    dc: f32,
 }
 
 struct OutputState {
@@ -126,13 +134,15 @@ struct Callbacks {
 }
 
 impl Callbacks {
-    fn new(ring: &Arc<Ring>, gain: f32) -> Self {
+    fn new(ring: &Arc<Ring>, gain: f32, mono: bool) -> Self {
         Callbacks {
             input: Box::into_raw(Box::new(InputState {
                 unit: ptr::null_mut(),
                 buffer: vec![0.0; MAX_FRAMES * 2].into_boxed_slice(),
                 ring: ring.clone(),
                 gain,
+                mono,
+                dc: 0.0,
             })),
             output: Box::into_raw(Box::new(OutputState {
                 ring: ring.clone(),
@@ -178,17 +188,27 @@ unsafe extern "C" fn input_proc(
     }
     let ring = &state.ring;
     let mut w = ring.write.load(Ordering::Relaxed);
-    let mut peak = 0f32;
+    let (mut peak_l, mut peak_r, mut clipped) = (0f32, 0f32, 0u32);
     for frame in state.buffer[..n * 2].chunks_exact(2) {
-        let (l, r) = (frame[0], frame[1]);
-        peak = peak.max(l.abs()).max(r.abs());
+        let (l, r) = (frame[0], if state.mono { frame[0] } else { frame[1] });
+        peak_l = peak_l.max(l.abs());
+        peak_r = peak_r.max(r.abs());
+        clipped += u32::from(l.abs() >= 0.99) + u32::from(r.abs() >= 0.99);
+        state.dc += (l - state.dc) * 0.0005;
         let p = (w % RING_FRAMES) * 2;
         ring.samples[p].store(limit(l * state.gain).to_bits(), Ordering::Relaxed);
         ring.samples[p + 1].store(limit(r * state.gain).to_bits(), Ordering::Relaxed);
         w += 1;
     }
     ring.write.store(w, Ordering::Release);
-    ring.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+    ring.peak
+        .fetch_max(peak_l.max(peak_r).to_bits(), Ordering::Relaxed);
+    ring.meter[0].fetch_max(peak_l.to_bits(), Ordering::Relaxed);
+    ring.meter[1].fetch_max(peak_r.to_bits(), Ordering::Relaxed);
+    ring.dc.store(state.dc.to_bits(), Ordering::Relaxed);
+    if clipped > 0 {
+        ring.clipped.fetch_add(clipped, Ordering::Relaxed);
+    }
     0
 }
 
@@ -305,10 +325,17 @@ impl Passthrough {
             target: AtomicUsize::new(256),
             reprime: AtomicBool::new(false),
             peak: AtomicU32::new(0),
+            meter: [AtomicU32::new(0), AtomicU32::new(0)],
+            dc: AtomicU32::new(0),
+            clipped: AtomicU32::new(0),
         });
 
         // Declared before the units, so on any early return the units are dropped first.
-        let callbacks = Callbacks::new(&ring, 10f32.powf(GAIN_DB / 20.0));
+        let mono = channels(input_id, sys::kAudioObjectPropertyScopeInput) == 1;
+        if mono {
+            eprintln!("passthrough: {input_name} is mono, playing it in both ears");
+        }
+        let callbacks = Callbacks::new(&ring, 10f32.powf(GAIN_DB / 20.0), mono);
         let (global, input_scope, output_scope) = (
             sys::kAudioUnitScope_Global as u32,
             sys::kAudioUnitScope_Input as u32,
@@ -421,6 +448,22 @@ impl Passthrough {
             output: self.output_name.clone(),
             loop_ms: self.in_latency_ms + target as f64 / self.in_rate * 1000.0,
         }
+    }
+
+    /// The input since the last call, for the log: peaks per channel before the gain, the
+    /// left channel's DC offset, and samples at full scale.
+    pub fn meter(&self) -> String {
+        let db = |peak: &AtomicU32| match f32::from_bits(peak.swap(0, Ordering::Relaxed)) {
+            p if p > 1e-6 => format!("{:.1}", 20.0 * p.log10()),
+            _ => "silent".into(),
+        };
+        format!(
+            "input peak L {} R {} dBFS, DC {:+.4}, clipped {}",
+            db(&self.ring.meter[0]),
+            db(&self.ring.meter[1]),
+            f32::from_bits(self.ring.dc.load(Ordering::Relaxed)),
+            self.ring.clipped.swap(0, Ordering::Relaxed),
+        )
     }
 
     fn apply_output(&mut self) {
@@ -627,11 +670,15 @@ fn latency_ms(id: u32, scope: u32, rate: f64) -> (f64, String) {
 }
 
 fn first_stream(id: u32, scope: u32) -> Option<u32> {
+    streams(id, scope).first().copied()
+}
+
+fn streams(id: u32, scope: u32) -> Vec<u32> {
     let addr = address(sys::kAudioDevicePropertyStreams, scope);
     let mut size = 0u32;
     unsafe {
         if sys::AudioObjectGetPropertyDataSize(id, &addr, 0, ptr::null(), &mut size) != 0 {
-            return None;
+            return Vec::new();
         }
         let mut streams = vec![0u32; size as usize / 4];
         if streams.is_empty()
@@ -644,8 +691,23 @@ fn first_stream(id: u32, scope: u32) -> Option<u32> {
                 streams.as_mut_ptr() as *mut c_void,
             ) != 0
         {
-            return None;
+            return Vec::new();
         }
-        streams.first().copied()
+        streams
     }
+}
+
+/// Channels across all of a device's streams on one side.
+fn channels(id: u32, scope: u32) -> u32 {
+    streams(id, scope)
+        .into_iter()
+        .filter_map(|s| {
+            get::<sys::AudioStreamBasicDescription>(
+                s,
+                sys::kAudioStreamPropertyVirtualFormat,
+                sys::kAudioObjectPropertyScopeGlobal,
+            )
+        })
+        .map(|f| f.mChannelsPerFrame)
+        .sum()
 }
