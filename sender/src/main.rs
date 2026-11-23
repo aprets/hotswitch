@@ -99,6 +99,8 @@ const PASSTHROUGH_RETRY: Duration = Duration::from_secs(5);
 const PASSTHROUGH_STALL: Duration = Duration::from_secs(2);
 /// How long entering PS5 mode waits for the HDMI switch to confirm it sent the PS5 here.
 const SWITCH_CONFIRM: Duration = Duration::from_secs(3);
+/// How often the PS5 audio input meter goes to the log while the loop runs.
+const METER_EVERY: Duration = Duration::from_secs(5);
 /// How long quitting waits for an owed hand-back.
 const HAND_BACK_WAIT: Duration = Duration::from_secs(6);
 
@@ -1728,6 +1730,7 @@ fn main() {
         flash_until: None,
         reset_update_at: None,
         next_tick: None,
+        meter_logged: Instant::now(),
         audio_check_at: None,
         switch,
         switch_active: None,
@@ -1804,6 +1807,8 @@ struct App {
     flash_until: Option<Instant>,
     reset_update_at: Option<Instant>,
     next_tick: Option<Instant>,
+    /// When the passthrough's input meter was last logged.
+    meter_logged: Instant,
     /// Debounced check of the passthrough's devices after a device change.
     audio_check_at: Option<Instant>,
     switch: Option<Arc<Switch>>,
@@ -2246,6 +2251,12 @@ impl App {
                 if let Some(input) = self.settings.monitor_input(self.mode) {
                     self.take_monitor(input);
                 }
+            }
+        }
+        if let Some(p) = &self.passthrough {
+            if self.meter_logged.elapsed() >= METER_EVERY {
+                self.meter_logged = Instant::now();
+                eprintln!("passthrough: {}", p.meter());
             }
         }
         // Safety nets: a device that dies without a device-list change, and an input that
