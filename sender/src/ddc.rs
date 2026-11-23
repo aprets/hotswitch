@@ -19,6 +19,7 @@ use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
+use core_graphics::display::CGDisplay;
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_char, c_void, CStr};
 use std::fs::File;
@@ -95,6 +96,56 @@ pub struct Identity {
 impl Identity {
     pub fn label(&self) -> String {
         format!("{} · {}", self.name, self.serial)
+    }
+}
+
+/// A screen macOS is showing: which monitor, how far left it starts, and whether it has the
+/// menu bar.
+pub struct Screen {
+    vendor: i64,
+    product: i64,
+    serial: i64,
+    x: f64,
+    main: bool,
+}
+
+pub fn screens() -> Vec<Screen> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let d = CGDisplay::new(id);
+            Screen {
+                vendor: d.vendor_number() as i64,
+                product: d.model_number() as i64,
+                serial: d.serial_number() as i64,
+                x: d.bounds().origin.x,
+                main: d.is_main(),
+            }
+        })
+        .collect()
+}
+
+/// Where a monitor is, in words a person can match to the desk: "Left, menu bar", "Right",
+/// "Only screen" or "Not showing" (switched away or detached).
+pub fn placement(id: &Identity, screens: &[Screen]) -> String {
+    let Some(me) = screens
+        .iter()
+        .find(|s| s.vendor == id.vendor && s.product == id.product && s.serial == id.serial_number)
+    else {
+        return "Not showing".into();
+    };
+    let left_of_me = screens.iter().filter(|s| s.x < me.x).count();
+    let position = match (screens.len(), left_of_me) {
+        (1, _) => "Only screen",
+        (_, 0) => "Left",
+        (n, i) if i == n - 1 => "Right",
+        _ => "Middle",
+    };
+    if me.main {
+        format!("{position}, menu bar")
+    } else {
+        position.to_string()
     }
 }
 
@@ -450,6 +501,24 @@ mod tests {
         assert!(resolve(&found, Some("")).is_err());
         assert!(resolve(&found, Some("MISSING")).is_err());
         assert_eq!(resolve(&found, Some("OTHER")), Ok(monitor("OTHER", 3)));
+    }
+
+    #[test]
+    fn placement_reads_like_the_desk() {
+        let screen = |serial, x, main| Screen {
+            vendor: 4242,
+            product: 1001,
+            serial,
+            x,
+            main,
+        };
+        let (left, right) = (monitor("L", 111), monitor("R", 222));
+        let both = [screen(222, 2560.0, false), screen(111, 0.0, true)];
+        assert_eq!(placement(&left, &both), "Left, menu bar");
+        assert_eq!(placement(&right, &both), "Right");
+        let one = [screen(222, 0.0, true)];
+        assert_eq!(placement(&right, &one), "Only screen, menu bar");
+        assert_eq!(placement(&left, &one), "Not showing");
     }
 
     #[test]

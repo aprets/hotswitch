@@ -192,7 +192,7 @@ const KEYS: &[(u16, &str, Code)] = &[
 pub struct Settings {
     /// Windows receiver, `IP:port`.
     pub receiver: Option<String>,
-    /// The PS5 monitor's serial. Unset works only while exactly one monitor can be used.
+    /// The PS5 monitor's serial. PS5 mode switches no monitor until one is saved.
     pub monitor: Option<String>,
     /// VCP 0x60 value of the PS5's input (0x11 is HDMI 1).
     pub ps5_input: u16,
@@ -201,10 +201,26 @@ pub struct Settings {
     /// In PS5 mode, also detach the monitor from macOS with BetterDisplay, as the receiver
     /// hooks do for the PC, so windows don't land on a screen showing the PS5.
     pub detach_display: bool,
-    /// CoreAudio input that carries the PS5's sound.
+    /// CoreAudio input that carries the PS5's sound. Empty: PS5 mode plays no audio.
     pub audio_input: String,
     /// Shortcut per mode, indexed like `Mode::ALL`.
     pub hotkeys: [Option<Hotkey>; 3],
+    /// The modes this Mac offers. Mac is always there; a desk without a PC leaves Windows out.
+    pub modes: Vec<Mode>,
+    /// The HDMI switch that sends the PS5 to one desk at a time. None: no switch.
+    pub hdmi_switch: Option<HdmiSwitch>,
+}
+
+/// How to reach the HDMI switch, and which of its outputs feeds this Mac's monitor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HdmiSwitch {
+    /// Tried in order, for example the mDNS name and then a fixed address.
+    pub urls: Vec<String>,
+    pub user: String,
+    /// Kept only in this file, which is readable by its owner alone.
+    pub password: String,
+    /// "A" is the TV; the Macs have "B" and "C".
+    pub output: String,
 }
 
 impl Default for Settings {
@@ -228,6 +244,8 @@ impl Default for Settings {
                 Some(ctrl(KEY_ESCAPE, false)),
                 Some(ctrl(KEY_ESCAPE, true)),
             ],
+            modes: Mode::ALL.to_vec(),
+            hdmi_switch: None,
         }
     }
 }
@@ -237,10 +255,15 @@ impl Settings {
         match mode {
             Mode::Mac => None,
             Mode::Windows => Some(AudioRoute::Network),
+            Mode::Ps5 if self.audio_input.is_empty() => None,
             Mode::Ps5 => Some(AudioRoute::Passthrough {
                 input: self.audio_input.clone(),
             }),
         }
+    }
+
+    pub fn has_mode(&self, mode: Mode) -> bool {
+        mode == Mode::Mac || self.modes.contains(&mode)
     }
 
     /// The monitor input a mode needs. Windows switching stays in the receiver hooks for now.
@@ -301,12 +324,19 @@ pub fn support_dir() -> PathBuf {
 }
 
 /// Replace `path` in one step: write a temporary file next to it, flush it to disk, rename.
-/// A crash leaves either the old file or the new one, never a truncated one.
+/// A crash leaves either the old file or the new one, never a truncated one. Only the owner
+/// can read it: settings can hold the HDMI switch's password.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)?;
+    let mut file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(&tmp, path)?;
@@ -340,6 +370,12 @@ mod tests {
         assert_eq!(partial.mac_input, 0x0F);
         assert!(partial.detach_display);
         assert_eq!(partial.audio_input, "Microphone In");
+        assert!(partial.has_mode(Mode::Windows) && partial.hdmi_switch.is_none());
+        let shui: Settings = serde_json::from_str(r#"{"modes":["ps5"]}"#).unwrap();
+        assert!(shui.has_mode(Mode::Mac) && shui.has_mode(Mode::Ps5));
+        assert!(!shui.has_mode(Mode::Windows));
+        let no_audio: Settings = serde_json::from_str(r#"{"audio_input":""}"#).unwrap();
+        assert!(no_audio.audio_route(Mode::Ps5).is_none());
     }
 
     #[test]
@@ -364,6 +400,9 @@ mod tests {
         write_atomically(&path, b"first, longer").unwrap();
         write_atomically(&path, b"second").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "owner only");
         assert!(!path.with_extension("tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

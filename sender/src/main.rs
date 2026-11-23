@@ -1,4 +1,5 @@
 mod ddc;
+mod hdmi_switch;
 mod monitor;
 mod passthrough;
 mod settings;
@@ -20,6 +21,7 @@ use core_graphics::{
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
+use hdmi_switch::Switch;
 use hotswitch_proto::{audio, Event};
 use monitor::{Job, Report, Want};
 use objc2::rc::Retained;
@@ -94,6 +96,8 @@ const DISPLAY_SETTLE: Duration = Duration::from_secs(2);
 const PASSTHROUGH_RETRY: Duration = Duration::from_secs(5);
 /// Restart a passthrough whose input has delivered nothing for this long.
 const PASSTHROUGH_STALL: Duration = Duration::from_secs(2);
+/// How long entering PS5 mode waits for the HDMI switch to confirm it sent the PS5 here.
+const SWITCH_CONFIRM: Duration = Duration::from_secs(3);
 /// How long quitting waits for an owed hand-back.
 const HAND_BACK_WAIT: Duration = Duration::from_secs(6);
 
@@ -129,6 +133,10 @@ enum UserEvent {
     WillSleep,
     /// The Mac or its screens woke, or displays were reconfigured.
     DisplaysChanged,
+    /// The HDMI switch's live output changed (or was re-sent after a reconnect).
+    SwitchOutput(String),
+    /// The answer to selecting this Mac's output on the HDMI switch.
+    SwitchSelected(Result<(), String>),
     Settings(Action),
     /// Audio devices came or went, or the default output changed.
     AudioDevicesChanged,
@@ -418,6 +426,11 @@ fn latest_release_version() -> Option<String> {
 }
 
 fn check_for_update() -> Option<String> {
+    // Local builds keep the crate's 0.1.0; only CI stamps a version. Every release looks newer
+    // to them, and installing one swaps the signature, so they never offer updates.
+    if self_update::cargo_crate_version!() == "0.1.0" {
+        return None;
+    }
     let latest = latest_release_version()?;
     if self_update::version::bump_is_greater(self_update::cargo_crate_version!(), &latest)
         .unwrap_or(false)
@@ -1544,6 +1557,26 @@ fn main() {
         });
     }
     watch_displays(proxy.clone());
+    let switch = settings
+        .hdmi_switch
+        .clone()
+        .and_then(|config| {
+            Switch::new(config)
+                .map_err(|e| eprintln!("hdmi switch: {e}"))
+                .ok()
+        })
+        .map(Arc::new);
+    if let Some(switch) = switch.clone() {
+        let proxy = Mutex::new(proxy.clone());
+        thread::spawn(move || {
+            switch.watch(|output| {
+                let _ = proxy
+                    .lock()
+                    .unwrap()
+                    .send_event(UserEvent::SwitchOutput(output));
+            })
+        });
+    }
     let monitor_jobs = {
         let proxy = Mutex::new(proxy.clone());
         monitor::spawn(support_dir.clone(), move |report| {
@@ -1611,12 +1644,16 @@ fn main() {
             &PredefinedMenuItem::separator(),
         ]);
     }
+    for (item, mode) in ui.modes.iter().zip(Mode::ALL) {
+        if settings.has_mode(mode) {
+            let _ = ui.menu.append(item);
+        }
+    }
+    let _ = ui.menu.append(&PredefinedMenuItem::separator());
+    if settings.has_mode(Mode::Windows) {
+        let _ = ui.menu.append(&ui.pc_line);
+    }
     let _ = ui.menu.append_items(&[
-        &ui.modes[0],
-        &ui.modes[1],
-        &ui.modes[2],
-        &PredefinedMenuItem::separator(),
-        &ui.pc_line,
         &PredefinedMenuItem::separator(),
         &ui.settings_item,
         &ui.log_item,
@@ -1670,6 +1707,10 @@ fn main() {
         reset_update_at: None,
         next_tick: None,
         audio_check_at: None,
+        switch,
+        switch_active: None,
+        entering_ps5: None,
+        switch_note: None,
         quitting: false,
         power_activity: Some(power_activity),
         log_file_path,
@@ -1743,6 +1784,13 @@ struct App {
     next_tick: Option<Instant>,
     /// Debounced check of the passthrough's devices after a device change.
     audio_check_at: Option<Instant>,
+    switch: Option<Arc<Switch>>,
+    /// The switch's live output, from its event stream. None until it has been heard from.
+    switch_active: Option<String>,
+    /// Entering PS5 mode waits until then for the switch to confirm.
+    entering_ps5: Option<Instant>,
+    /// Shown with the monitor line, e.g. "HDMI switch not reachable".
+    switch_note: Option<String>,
     quitting: bool,
     power_activity: Option<PowerActivity>,
     log_file_path: PathBuf,
@@ -1771,6 +1819,7 @@ impl App {
             self.audio_check_at,
             self.display_check_at,
             self.passthrough_retry_at,
+            self.entering_ps5,
         ]
         .into_iter()
         .flatten()
@@ -1807,6 +1856,11 @@ impl App {
             self.display_check_at = None;
             // Only acts on an owed hand-back; a refused take is never retried on its own.
             let _ = self.monitor_jobs.send(Job::Reconcile);
+        }
+        if self.entering_ps5.is_some_and(|t| now >= t) {
+            eprintln!("hdmi switch: no confirmation, entering PS5 mode anyway");
+            self.switch_note = Some("HDMI switch didn't confirm".into());
+            self.finish_entering_ps5();
         }
         if self.next_tick.is_some_and(|t| now >= t) {
             self.tick();
@@ -1876,6 +1930,17 @@ impl App {
             UserEvent::DisplaysChanged => {
                 self.display_check_at = Some(Instant::now() + DISPLAY_SETTLE);
             }
+            UserEvent::SwitchOutput(output) => self.switch_output(output),
+            UserEvent::SwitchSelected(result) => {
+                if let Err(e) = result {
+                    eprintln!("hdmi switch: {e}");
+                    self.switch_note = Some("HDMI switch not reachable".into());
+                    // Still do the local steps.
+                    if self.entering_ps5.is_some() {
+                        self.finish_entering_ps5();
+                    }
+                }
+            }
             UserEvent::Menu(me) => self.menu_event(me),
         }
     }
@@ -1913,7 +1978,11 @@ impl App {
         } else {
             requested
         };
-        if target == self.mode {
+        // Changed their mind while the switch was still moving the PS5 here.
+        if target != Mode::Ps5 && self.entering_ps5.take().is_some() {
+            self.release_switch(false);
+        }
+        if target == self.mode || !self.settings.has_mode(target) {
             return;
         }
         if target == Mode::Windows
@@ -1922,7 +1991,89 @@ impl App {
             self.flash_blocked();
             return;
         }
+        // Entering PS5 mode sends the PS5 here first; the local steps follow its confirmation.
+        if target == Mode::Ps5 && self.begin_ps5() {
+            return;
+        }
+        // Leaving PS5 mode by this Mac's own hand (shortcut, menu, sleep) frees the switch.
+        let releasing = self.mode == Mode::Ps5;
+        self.apply_mode(target);
+        if releasing {
+            self.release_switch(false);
+        }
+    }
 
+    /// Ask the switch for this Mac's output. True while waiting for it to confirm.
+    fn begin_ps5(&mut self) -> bool {
+        let Some(switch) = self.switch.clone() else {
+            return false;
+        };
+        if self.switch_active.as_deref() == Some(switch.output()) {
+            return false;
+        }
+        if self.entering_ps5.is_some() {
+            return true;
+        }
+        eprintln!("hdmi switch: selecting {}", switch.output());
+        self.switch_note = None;
+        self.entering_ps5 = Some(Instant::now() + SWITCH_CONFIRM);
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let result = switch.select(switch.output());
+            let _ = proxy.send_event(UserEvent::SwitchSelected(result));
+        });
+        true
+    }
+
+    fn finish_entering_ps5(&mut self) {
+        if self.entering_ps5.take().is_some() && self.mode != Mode::Ps5 {
+            self.apply_mode(Mode::Ps5);
+        }
+    }
+
+    /// The switch reported its live output. It confirms a pending entry, and makes this Mac
+    /// leave PS5 mode when the PS5 went elsewhere. It never enters PS5 mode, and leaving this
+    /// way never changes the switch.
+    fn switch_output(&mut self, output: String) {
+        eprintln!("hdmi switch: live output {output}");
+        self.switch_active = Some(output.clone());
+        let Some(mine) = self.switch.as_ref().map(|s| s.output().to_string()) else {
+            return;
+        };
+        if self.entering_ps5.is_some() && output == mine {
+            self.finish_entering_ps5();
+        } else if hdmi_switch::should_leave(&output, &mine, self.mode == Mode::Ps5) {
+            eprintln!("hdmi switch: the PS5 went to {output}, leaving PS5 mode");
+            self.apply_mode(Mode::Mac);
+        }
+    }
+
+    /// After leaving PS5 mode by this Mac's own hand: send the switch back to the TV, if it
+    /// still shows this Mac's output.
+    fn release_switch(&mut self, wait: bool) {
+        let Some(switch) = self.switch.clone() else {
+            return;
+        };
+        let Some(target) =
+            hdmi_switch::release_target(self.switch_active.as_deref(), switch.output())
+        else {
+            return;
+        };
+        eprintln!("hdmi switch: nobody on the PS5 here, back to {target}");
+        let run = move || {
+            if let Err(e) = switch.select(target) {
+                eprintln!("hdmi switch: {e}");
+            }
+        };
+        if wait {
+            run();
+        } else {
+            thread::spawn(run);
+        }
+    }
+
+    /// Carry out a mode change: capture, audio route and monitor input.
+    fn apply_mode(&mut self, target: Mode) {
         let from = self.mode;
         eprintln!("mode: {} -> {}", from.key(), target.key());
         if from == Mode::Windows {
@@ -2286,6 +2437,9 @@ impl App {
                 "monitor: hand-back still running at {reason}; it is owed to the next launch"
             );
         }
+        if self.mode == Mode::Ps5 || self.entering_ps5.take().is_some() {
+            self.release_switch(true);
+        }
         if self.mode != Mode::Mac {
             run_hook(HookKind::ModeChanged, true, &[self.mode.key(), "mac"]);
             self.mode = Mode::Mac;
@@ -2338,7 +2492,7 @@ impl App {
                 &self.ui.route_line,
             ];
             if ps5 {
-                let _ = self.ui.menu.insert_items(&lines, 4 + menu_top());
+                let _ = self.ui.menu.insert_items(&lines, self.status_top());
             } else {
                 for line in lines {
                     let _ = self.ui.menu.remove(line);
@@ -2349,7 +2503,8 @@ impl App {
         let need_access = self.tap.is_none();
         if need_access != self.ui.access_shown {
             if need_access {
-                let at = menu_top() + if ps5 { 8 } else { 5 };
+                let pc_line = usize::from(self.settings.has_mode(Mode::Windows));
+                let at = self.status_top() + if ps5 { 3 } else { 0 } + pc_line;
                 let _ = self.ui.menu.insert(&self.ui.access_item, at);
             } else {
                 let _ = self.ui.menu.remove(&self.ui.access_item);
@@ -2361,11 +2516,26 @@ impl App {
         self.refresh_icon();
     }
 
+    /// Where the status lines start: after the dry-run line, this Mac's modes and a separator.
+    fn status_top(&self) -> usize {
+        let modes = Mode::ALL
+            .iter()
+            .filter(|m| self.settings.has_mode(**m))
+            .count();
+        menu_top() + modes + 1
+    }
+
     fn refresh_status_lines(&self) {
         if !self.ui.ps5_shown {
             return;
         }
-        self.ui.monitor_line.set_text(&self.monitor_line);
+        match &self.switch_note {
+            Some(note) => self
+                .ui
+                .monitor_line
+                .set_text(format!("{} · {note}", self.monitor_line)),
+            None => self.ui.monitor_line.set_text(&self.monitor_line),
+        }
         let (level, route) = match (&self.passthrough, &self.passthrough_error) {
             (Some(p), _) => {
                 let status = p.status();
@@ -2384,6 +2554,9 @@ impl App {
                 (level, route)
             }
             (None, Some(e)) => (e.clone(), "Waiting for it to come back".to_string()),
+            (None, None) if !self.wants_passthrough() => {
+                ("No PS5 audio input set".to_string(), String::new())
+            }
             (None, None) => ("Starting audio…".to_string(), String::new()),
         };
         self.ui.level_line.set_text(level);
