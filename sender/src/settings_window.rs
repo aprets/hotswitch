@@ -300,9 +300,10 @@ impl SettingsWindow {
             ids.push(None);
             titles.push("Choose a monitor".into());
         }
+        let screens = ddc::screens();
         for m in ddc::Layout::read().targetable() {
             ids.push(Some(m.serial.clone()));
-            titles.push(m.label());
+            titles.push(format!("{} · {}", ddc::placement(&m, &screens), m.label()));
         }
         if let Some(saved) = &settings.monitor {
             if !ids.contains(&Some(saved.clone())) {
@@ -332,7 +333,10 @@ impl SettingsWindow {
             .map(|(_, name)| name)
             .collect();
         let mut titles = names.clone();
-        if !names.contains(&settings.audio_input) {
+        if settings.audio_input.is_empty() {
+            names.insert(0, String::new());
+            titles.insert(0, "None".into());
+        } else if !names.contains(&settings.audio_input) {
             names.push(settings.audio_input.clone());
             titles.push(format!("{} (not available)", settings.audio_input));
         }

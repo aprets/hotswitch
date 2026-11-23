@@ -113,6 +113,27 @@ A dry run (`open --env HOTSWITCH_DRY_RUN=1 Hotswitch.app`) tries modes and hand-
 - settings, the hand-back record and the log are kept apart, under `Application Support/Hotswitch/dry-run/` and `hotswitch-sender-dry-run.log`;
 - the menu bar shows "DRY RUN", and the menu starts with "Dry run: monitors simulated, hooks off".
 
+### HDMI switch
+
+With an ESPHome HDMI switch sending the PS5 to one desk at a time (a select called "HDMI input" with outputs A, B, C, and LEDs "Input A/B/C LED"), each Mac follows it:
+
+- **Entering PS5 mode** (shortcut or menu) first selects this Mac's output on the switch, waits up to 3 s for the switch's event stream to confirm, then switches the monitor and starts the audio. If the switch is unreachable or doesn't confirm, the local steps still run and the menu says so.
+- **The event stream only makes a Mac leave.** When the switch moves to another output (the other Mac took the PS5, or someone pressed the button), this Mac leaves PS5 mode by itself and leaves the switch alone. Events never enter PS5 mode.
+- **Leaving PS5 mode by this Mac's own hand** (shortcut, menu, quit or sleep) sends the switch back to the TV (A), but only while it still shows this Mac's output.
+
+Per Mac, in `settings.json` (written owner-only, since it holds the switch's password):
+
+```json
+"hdmi_switch": { "urls": ["http://192.168.1.50", "http://hdmi-switch.local"], "user": "hotswitch", "password": "…", "output": "C" },
+"modes": ["mac", "windows", "ps5"],
+"detach_display": true,
+"audio_input": "Microphone In"
+```
+
+`modes` lists what this Mac offers (a desk without a PC uses `["mac", "ps5"]`), `detach_display` is off for a single-monitor desk, and an empty `audio_input` means PS5 mode plays no audio. List the IP first: `.local` names can take seconds to resolve. Changes to `hdmi_switch` apply at the next launch.
+
+Local builds report version 0.1.0 and never offer updates: a CI release would replace their signature and its permissions.
+
 ### macOS hooks
 
 The sender runs optional executable hook scripts from:
