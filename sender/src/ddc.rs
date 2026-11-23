@@ -136,21 +136,25 @@ pub fn targetable(main: Option<MainDisplay>, found: &[Identity]) -> Vec<Identity
         .collect()
 }
 
-/// Pick the target: the monitor with `wanted`'s serial, or with no choice saved, the only
-/// targetable monitor. Never a guess between several.
-pub fn resolve(candidates: &[Identity], wanted: Option<&str>) -> Result<Identity, String> {
-    match wanted {
-        Some(serial) => candidates
-            .iter()
-            .find(|c| c.serial == serial)
-            .cloned()
-            .ok_or_else(|| format!("Monitor {serial} isn't connected or can't be used")),
-        None => match candidates {
-            [only] => Ok(only.clone()),
-            [] => Err("No monitor can be used for PS5 mode".into()),
-            _ => Err("Choose the PS5 monitor in Settings".into()),
-        },
+/// The monitor saved for PS5 mode, if it can be switched right now. Never picks one on its
+/// own: with no serial saved it refuses, because the main display can move to any monitor.
+pub fn resolve(
+    main: Option<MainDisplay>,
+    found: &[Identity],
+    wanted: Option<&str>,
+) -> Result<Identity, String> {
+    let Some(serial) = wanted else {
+        return Err("Choose the PS5 monitor in Settings".into());
+    };
+    let mut matches = found.iter().filter(|id| id.serial == serial);
+    let id = matches
+        .next()
+        .ok_or_else(|| format!("Monitor {serial} isn't connected"))?;
+    if matches.next().is_some() {
+        return Err(format!("Another monitor shares serial {serial}"));
     }
+    usable(main, id)?;
+    Ok(id.clone())
 }
 
 /// What decides whether a running DDC operation may continue. Compared before every transaction.
@@ -421,7 +425,7 @@ unsafe fn registry_string(entry: IoObject, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// `hotswitch-sender ddc [set <vcp> <value> [serial]]`, for debugging
+/// `hotswitch-sender ddc [set <vcp> <value> <serial>]`, for debugging
 /// and hooks. The plain listing sends nothing to any monitor and says why a monitor can't be
 /// used. The same safety rules apply here as in the app.
 pub fn cli(args: &[String]) {
@@ -431,7 +435,11 @@ pub fn cli(args: &[String]) {
     };
     let open = |serial: Option<&String>| -> Result<Target, String> {
         let layout = Layout::read();
-        Target::open(&resolve(&layout.targetable(), serial.map(String::as_str))?)
+        Target::open(&resolve(
+            layout.main(),
+            &layout.found(),
+            serial.map(String::as_str),
+        )?)
     };
     let run = || -> Result<(), String> {
         match args {
@@ -449,11 +457,11 @@ pub fn cli(args: &[String]) {
                 }
                 Ok(())
             }
-            [cmd, vcp, value, rest @ ..] if cmd == "set" && rest.len() <= 1 => {
+            [cmd, vcp, value, serial] if cmd == "set" => {
                 let (vcp, value) = parse(vcp).zip(parse(value)).ok_or("bad arguments")?;
-                open(rest.first())?.write(vcp as u8, value)
+                open(Some(serial))?.write(vcp as u8, value)
             }
-            _ => Err("usage: hotswitch-sender ddc [set <vcp> <value> [serial]]".into()),
+            _ => Err("usage: hotswitch-sender ddc [set <vcp> <value> <serial>]".into()),
         }
     };
     if let Err(e) = run() {
@@ -525,22 +533,34 @@ mod tests {
     #[test]
     fn duplicate_serials_are_never_targets() {
         let main = Some((1, 2, 3));
-        let a = monitor("SAME", 1);
-        let b = monitor("SAME", 2);
-        let c = monitor("OTHER", 3);
-        let t = targetable(main, &[a.clone(), b, c.clone()]);
-        assert_eq!(t, vec![c.clone()]);
-        assert!(resolve(&t, Some("SAME")).is_err());
-        assert_eq!(resolve(&t, Some("OTHER")), Ok(c.clone()));
-        assert_eq!(resolve(&t, None), Ok(c), "the only one");
-        assert!(
-            resolve(
-                &targetable(main, &[a.clone(), monitor("OTHER", 3), monitor("THIRD", 4)]),
-                None
-            )
-            .is_err(),
-            "two choices, none saved"
+        let found = [monitor("SAME", 1), monitor("SAME", 2), monitor("OTHER", 3)];
+        assert_eq!(targetable(main, &found), vec![monitor("OTHER", 3)]);
+        assert!(resolve(main, &found, Some("SAME")).is_err());
+        assert_eq!(
+            resolve(main, &found, Some("OTHER")),
+            Ok(monitor("OTHER", 3))
         );
-        assert!(resolve(&[], None).is_err());
+        assert!(resolve(main, &found, Some("MISSING")).is_err());
+    }
+
+    #[test]
+    fn ps5_mode_never_picks_a_monitor_on_its_own() {
+        // 23 Nov: macOS moved the main display to the PS5 monitor, leaving its twin as the only
+        // usable monitor. With no serial saved, that twin (the wrong screen) must not be picked.
+        let ps5 = monitor("PS5MON", 111);
+        let other = monitor("OTHERMON", 222);
+        let found = [ps5.clone(), other.clone()];
+        let ps5_is_main = Some((4242, 1001, 111));
+        assert_eq!(targetable(ps5_is_main, &found), vec![other.clone()]);
+        assert_eq!(
+            resolve(ps5_is_main, &found, None),
+            Err("Choose the PS5 monitor in Settings".into())
+        );
+        // Saved, but showing the menu bar right now: refused, with the reason.
+        let refused = resolve(ps5_is_main, &found, Some("PS5MON")).unwrap_err();
+        assert!(refused.contains("main display"), "{refused}");
+        // Saved, and the other monitor is the main display: fine.
+        let other_is_main = Some((4242, 1001, 222));
+        assert_eq!(resolve(other_is_main, &found, Some("PS5MON")), Ok(ps5));
     }
 }

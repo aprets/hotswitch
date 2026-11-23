@@ -102,11 +102,11 @@ DDC rules:
 
 - Monitors are found from the IORegistry only, with no EDID or I2C traffic.
 - A monitor that could be showing the Mac's main display is never touched. If the main display can't be identified, no monitor is.
-- A monitor is targeted only by a serial number no other monitor shares. Without a saved choice, PS5 mode uses the only usable monitor and refuses when there are several.
+- A monitor is targeted only by a serial number no other monitor shares. PS5 mode never picks a monitor on its own: it switches only the one saved in Settings, and refuses (saying why in the menu) while that monitor is the main display, because macOS can move the main display to any monitor.
 - Before every I2C transaction the display layout is checked again; any change stops the operation.
 - DDC only writes, each write sent once. Operations are at least a second apart, queued switches collapse into the latest, and one lock file serializes DDC across the app, the CLI and hooks. Nothing reads or polls the monitor.
 
-`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc set <vcp> <value> [serial]` follows the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.
+`hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc set <vcp> <value> <serial>` follows the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.
 
 A dry run (`open --env HOTSWITCH_DRY_RUN=1 Hotswitch.app`) tries modes and hand-back without touching hardware:
 - no DDC service is ever opened, and DDC writes and BetterDisplay calls are only logged;

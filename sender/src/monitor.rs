@@ -150,7 +150,8 @@ struct Hardware;
 impl Monitors for Hardware {
     fn resolve(&mut self, wanted: Option<&str>) -> Result<Identity, String> {
         // Registry only: no DDC until the target is settled.
-        ddc::resolve(&Layout::read().targetable(), wanted)
+        let layout = Layout::read();
+        ddc::resolve(layout.main(), &layout.found(), wanted)
     }
 
     fn open(&mut self, identity: &Identity) -> Result<Box<dyn InputPort>, String> {
