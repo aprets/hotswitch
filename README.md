@@ -127,10 +127,11 @@ Per Mac, in `settings.json` (written owner-only, since it holds the switch's pas
 "hdmi_switch": { "urls": ["http://192.168.1.50", "http://hdmi-switch.local"], "user": "hotswitch", "password": "…", "output": "C" },
 "modes": ["mac", "windows", "ps5"],
 "detach_display": true,
+"monitor_control": "ddc",
 "audio_input": "Microphone In"
 ```
 
-`modes` lists what this Mac offers (a desk without a PC uses `["mac", "ps5"]`), `detach_display` is off for a single-monitor desk, and an empty `audio_input` means PS5 mode plays no audio. List the IP first: `.local` names can take seconds to resolve. Changes to `hdmi_switch` apply at the next launch.
+`modes` lists what this Mac offers (a desk without a PC uses `["mac", "ps5"]`), `detach_display` is off for a single-monitor desk, and an empty `audio_input` means PS5 mode plays no audio. `monitor_control` is `ddc` by default. For a monitor without DDC/CI, set it to `display_sleep` and set the monitor's input to auto-select: once the switch confirms, PS5 mode sleeps the Mac's display, so the monitor finds the PS5 on its own. Leaving wakes the display and, as above, sends the switch to the TV, so the monitor finds the Mac again. `none` leaves the monitor alone. List the IP first: `.local` names can take seconds to resolve. Changes to `hdmi_switch` apply at the next launch.
 
 Local builds report version 0.1.0 and never offer updates: a CI release would replace their signature and its permissions.
 
