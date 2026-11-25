@@ -96,6 +96,8 @@ The PS5 plugs into the monitor over HDMI. The monitor's 3.5 mm audio out goes in
 
 Leaving PS5 mode stops the loop and hands the monitor back. It re-attaches the display first, waits two seconds for it to settle, then switches the monitor to the Mac's input (Settings, "Mac input", DisplayPort 1 by default). Nothing reads the monitor: a monitor showing another input can't be trusted to report it. The hand-back record is cleared only after that write succeeds; if a step fails, the hand-back stays owed. The record (`monitor-claim.json`) keeps the monitor, both inputs and whether it detached the display, as they were at entry, so Settings edits don't change it. It survives a crash, sleep or an unplugged dock and is retried on wake, when displays come back and at the next launch. Quitting waits for it, up to six seconds. Sleep ends PS5 mode; a locked or sleeping screen doesn't.
 
+While PS5 mode is on, Hotswitch forces macOS Game Mode on with Apple's `gamepolicyctl game-mode set on`, for its lower Bluetooth latency to AirPods and controllers. Leaving PS5 mode, quitting, and the next launch after a crash set it back to `auto`; a marker file (`game-mode-forced`) records that it is forced. `gamepolicyctl` ships only with full Xcode in `/Applications`, not the Command Line Tools, and runs as the user. Without it PS5 mode still works and the menu says "Game Mode needs Xcode". An Xcode older than macOS can fail to run it; the menu then says "Game Mode didn't turn on". macOS's own route, a game in full screen, doesn't fit: the PS5 isn't a Mac app, and a full-screen window would take over the screen that stays with the Mac.
+
 The loop follows the default output. It rebinds both its input and output after audio devices come and go (for example a dock that reboots), once they settle for a second, and restarts if its input stops delivering.
 
 DDC rules:
@@ -108,7 +110,7 @@ DDC rules:
 `hotswitch-sender ddc` lists the monitors and why any can't be used, sending nothing. `ddc set <vcp> <value> <serial>` follows the same rules. Only one Hotswitch runs at a time, so a single process owns the hand-back record.
 
 A dry run (`open --env HOTSWITCH_DRY_RUN=1 Hotswitch.app`) tries modes and hand-back without touching hardware:
-- no DDC service is ever opened, and DDC writes and BetterDisplay calls are only logged;
+- no DDC service is ever opened, and DDC writes, BetterDisplay calls and Game Mode changes are only logged;
 - hooks don't run, and the login item isn't touched;
 - settings, the hand-back record and the log are kept apart, under `Application Support/Hotswitch/dry-run/` and `hotswitch-sender-dry-run.log`;
 - the menu bar shows "DRY RUN", and the menu starts with "Dry run: monitors simulated, hooks off".
