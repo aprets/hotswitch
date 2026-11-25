@@ -1,0 +1,13 @@
+name: Test
+
+on:
+  pull_request:
+
+jobs:
+  sender:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p hotswitch-proto -p hotswitch-sender

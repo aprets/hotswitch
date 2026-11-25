@@ -662,6 +662,69 @@ fn set_display_asleep(asleep: bool) {
     }
 }
 
+/// Apple's Game Mode switch. It ships with full Xcode only, not the Command Line Tools.
+const GAME_POLICY: &str = "/Applications/Xcode.app/Contents/Developer/usr/bin/gamepolicyctl";
+/// Present while this app has Game Mode forced on, so a launch after a crash hands it back.
+const GAME_MODE_MARKER: &str = "game-mode-forced";
+
+/// Game Mode is forced on in PC and PS5 mode, whose sound plays through this Mac, for its lower
+/// Bluetooth latency to AirPods and controllers. A switch that changes it: `Some(true)` to force
+/// it, `Some(false)` to hand it back. PC to PS5 and back keeps it on, so it never flaps.
+fn game_mode_change(from: Mode, to: Mode) -> Option<bool> {
+    ((from == Mode::Mac) != (to == Mode::Mac)).then_some(to != Mode::Mac)
+}
+
+/// Force macOS Game Mode on, or hand it back to macOS ("auto"). Runs as the user, no root. Err
+/// is the note for the menu.
+fn force_game_mode(dir: &Path, on: bool) -> Result<(), &'static str> {
+    let setting = if on { "on" } else { "auto" };
+    if !Path::new(GAME_POLICY).is_file() {
+        // Without the tool nothing was forced, so there is nothing to hand back.
+        if !on {
+            return Ok(());
+        }
+        eprintln!("game mode: {GAME_POLICY} not found");
+        return Err("Game Mode needs Xcode");
+    }
+    if settings::dry_run() {
+        eprintln!("game mode dry run: would set {setting}");
+        return Ok(());
+    }
+    let marker = dir.join(GAME_MODE_MARKER);
+    if on {
+        if let Err(e) = std::fs::write(&marker, "") {
+            eprintln!("game mode: can't save {}: {e}", marker.display());
+            return Err("Game Mode didn't turn on");
+        }
+    }
+    let failed = match std::process::Command::new(GAME_POLICY)
+        .args(["game-mode", "set", setting])
+        .output()
+    {
+        Ok(out) if out.status.success() => None,
+        // An Xcode older than macOS fails here with a missing symbol.
+        Ok(out) => Some(format!(
+            "{}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(why) = failed {
+        eprintln!("game mode: set {setting} failed: {why}");
+        return Err(if on {
+            "Game Mode didn't turn on"
+        } else {
+            "Game Mode is still forced on"
+        });
+    }
+    eprintln!("game mode: {setting}");
+    if !on {
+        let _ = std::fs::remove_file(&marker);
+    }
+    Ok(())
+}
+
 fn run_hook(kind: HookKind, wait: bool, args: &[&str]) {
     let path = hook_path(kind);
     let label = kind.label();
@@ -1436,6 +1499,10 @@ fn main() {
             Err(err) => eprintln!("ignoring invalid receiver address argument: {err}"),
         }
     }
+    if support_dir.join(GAME_MODE_MARKER).exists() {
+        eprintln!("game mode: still forced from the last run");
+        let _ = force_game_mode(&support_dir, false);
+    }
     if let Err(e) = settings.save(&support_dir) {
         eprintln!("settings: failed to save: {e}");
     }
@@ -1736,6 +1803,7 @@ fn main() {
         switch_active: None,
         entering_ps5: None,
         switch_note: None,
+        game_mode_note: None,
         quitting: false,
         power_activity: Some(power_activity),
         log_file_path,
@@ -1818,6 +1886,8 @@ struct App {
     entering_ps5: Option<Instant>,
     /// Shown with the monitor line, e.g. "HDMI switch not reachable".
     switch_note: Option<String>,
+    /// Shown with the PS5 or PC line when Game Mode isn't forced, e.g. "Game Mode needs Xcode".
+    game_mode_note: Option<&'static str>,
     quitting: bool,
     power_activity: Option<PowerActivity>,
     log_file_path: PathBuf,
@@ -1936,6 +2006,8 @@ impl App {
             UserEvent::ReleaseCapture(reason) => {
                 if self.release_capture(reason) && self.mode == Mode::Windows {
                     self.mode = Mode::Mac;
+                    // PC mode ended without apply_mode, so Game Mode goes back here.
+                    self.game_mode_note = force_game_mode(&self.support_dir, false).err();
                     run_hook(HookKind::ModeChanged, false, &["windows", "mac"]);
                     self.refresh_menu();
                 }
@@ -2107,6 +2179,9 @@ impl App {
             self.release_capture("mode switch");
         }
         self.mode = target;
+        if let Some(on) = game_mode_change(from, target) {
+            self.game_mode_note = force_game_mode(&self.support_dir, on).err();
+        }
 
         // Audio follows the mode's route; the UDP listener runs regardless.
         self.passthrough = None;
@@ -2488,6 +2563,9 @@ impl App {
         if self.mode == Mode::Ps5 && self.settings.monitor_control == MonitorControl::DisplaySleep {
             set_display_asleep(false);
         }
+        if self.mode != Mode::Mac {
+            let _ = force_game_mode(&self.support_dir, false);
+        }
         if self.mode == Mode::Ps5 || self.entering_ps5.take().is_some() {
             self.release_switch(true);
         }
@@ -2511,13 +2589,17 @@ impl App {
     }
 
     fn pc_status(&self) -> String {
-        match (
+        let status = match (
             &self.settings.receiver,
             self.receiver_connected.load(Ordering::SeqCst),
         ) {
             (None, _) => "No PC address set".into(),
             (Some(_), true) => "PC connected".into(),
             (Some(addr), false) => format!("PC not reachable at {addr}"),
+        };
+        match self.game_mode_note {
+            Some(note) if self.mode == Mode::Windows => format!("{status} · {note}"),
+            _ => status,
         }
     }
 
@@ -2580,13 +2662,12 @@ impl App {
         if !self.ui.ps5_shown {
             return;
         }
-        match &self.switch_note {
-            Some(note) => self
-                .ui
-                .monitor_line
-                .set_text(format!("{} · {note}", self.monitor_line)),
-            None => self.ui.monitor_line.set_text(&self.monitor_line),
-        }
+        let monitor = Some(self.monitor_line.as_str()).filter(|l| !l.is_empty());
+        let line: Vec<&str> = [monitor, self.switch_note.as_deref(), self.game_mode_note]
+            .into_iter()
+            .flatten()
+            .collect();
+        self.ui.monitor_line.set_text(line.join(" · "));
         let (level, route) = match (&self.passthrough, &self.passthrough_error) {
             (Some(p), _) => {
                 let status = p.status();
@@ -2639,6 +2720,18 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_mode_is_forced_outside_mac_mode_and_never_flaps() {
+        use Mode::{Mac, Ps5, Windows};
+        assert_eq!(game_mode_change(Mac, Ps5), Some(true));
+        assert_eq!(game_mode_change(Mac, Windows), Some(true));
+        assert_eq!(game_mode_change(Ps5, Windows), None, "stays on");
+        assert_eq!(game_mode_change(Windows, Ps5), None, "stays on");
+        assert_eq!(game_mode_change(Ps5, Mac), Some(false));
+        assert_eq!(game_mode_change(Windows, Mac), Some(false));
+        assert_eq!(game_mode_change(Mac, Mac), None);
+    }
 
     #[test]
     fn a_heartbeat_from_the_old_receiver_cant_reconnect() {
